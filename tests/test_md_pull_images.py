@@ -745,6 +745,17 @@ class StreamingAndSyntaxTest(unittest.TestCase):
             capture_output=True, text=True, encoding="utf-8",
         )
 
+    def test_space_before_paren_is_not_an_image(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            md = Path(work) / "space.md"
+            original = f"这是文本 ![a] ({base}/pic/a.png) 不是图片\n"
+            md.write_text(original, encoding="utf-8")
+            proc = self._run(str(md), "--rewrite")
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("远程 0", proc.stdout)
+            self.assertEqual(md.read_text(encoding="utf-8"), original)
+            self.assertFalse((Path(work) / "space.assets").exists())
+
     def test_spool_files_are_cleaned_after_success(self):
         with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
             md = Path(work) / "ok.md"

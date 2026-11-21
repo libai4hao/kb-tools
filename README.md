@@ -4,6 +4,8 @@
 
 纯 Python 标准库实现，无第三方依赖，Python 3.8+。
 
+![CI](https://github.com/libai4hao/kb-tools/actions/workflows/ci.yml/badge.svg)
+
 ## 工具列表
 
 | 工具 | 作用 |
@@ -158,6 +160,7 @@ python md_pull_images.py 排序算法.md --rewrite \
 - 内容校验基于图片文件签名与 MIME 检查，不执行完整的图像解码；当前识别 PNG/APNG/JPEG/GIF/WebP/BMP/TIFF/ICO/AVIF/SVG，HEIC、JXL 等格式会被判为不支持而失败；
 - 为避免把代码示例当图片改写，围栏代码、缩进代码、行内代码、`<pre>`/`<code>` 和 HTML 注释会被整体屏蔽；代价是列表项内以 4 空格缩进到「缩进代码」位置的图片也会被跳过，这类笔记请减少缩进或改用围栏外的普通段落；
 - 图片文件名含空格、`#`、`%` 时，回写会做百分号编码（`![a](assets/a%20b.png)`），否则 Markdown 会把空格当标题分隔、把 `#` 当片段；括号成对时保持原样，不成对才编码；
+- `![a] (url)`（标签和括号之间有空白的写法）按 CommonMark 算普通文本，不会被下载或改写；要当图片处理请写成 `![a](url)`；
 - `<assets-dir>` 与 Markdown 不在同一盘符（Windows）时无法生成相对链接：图片仍会落盘，该文件的回写会被跳过并计为失败，程序继续处理其余文件；
 - 单个文件出错（只读、无写权限、路径异常）只记录失败，不会中断整批任务；
 - 每张图下载完立即写入资产目录的临时文件（`.mdpull-*.part`），命名确定后再原子改名成最终文件；内存峰值只与 `--jobs × --max-image-size` 有关（默认 8 × 25 MiB 封顶），不再随图片总量线性增长。进程被强杀时可能残留 `.mdpull-*.part`，确认没有任务在跑后可直接删除，正常运行（含失败、跳过）都会清理；
@@ -174,6 +177,7 @@ kb-tools/
 ├── md_pull_images.py          # 拉取 md 远程图片
 ├── tests/
 │   └── test_md_pull_images.py # 本地 HTTP 服务做的离线测试
+├── .github/workflows/ci.yml   # Linux/Windows × 3.8/3.11/3.13 测试矩阵
 ├── .gitignore
 ├── LICENSE
 └── README.md
@@ -188,6 +192,8 @@ python -m unittest discover -s tests -v
 ```
 
 测试覆盖下载与回写、引用式重复引用、代码块与 HTML 属性解析、同名文件冲突与 manifest 幂等、数值参数边界、图片体积/内容校验、私网与重定向拦截、`Retry-After` 日期解析、URL/站点分桶规范化，以及同源限流和跨源并行；另有一组用例校验 README 参数表与 CLI 参数、默认值保持同步，改参数时文档会跟着报错。离线测试的本地 HTTP 服务显式使用 `--allow-private-addresses`。
+
+CI（`.github/workflows/ci.yml`）在 Ubuntu 与 Windows 上跑 Python 3.8、3.11、3.13 三档矩阵，覆盖 README 声明的 3.8+ 最低版本；本地只装了 3.13/3.11 也能靠单测里的 `ast.parse(feature_version=(3, 8))` 兜住语法层面的回退。
 
 ## 贡献
 

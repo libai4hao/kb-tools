@@ -212,8 +212,7 @@ def _markdown_inline_image_hits(text: str, masked: str) -> list[ImageHit]:
         if alt_end < 0:
             continue
         cursor = alt_end + 1
-        while cursor < len(masked) and masked[cursor].isspace():
-            cursor += 1
+        # `![a] (url)` 里括号前有空白，CommonMark 不把它当图片，这里同样跳过。
         if cursor >= len(masked) or masked[cursor] != "(":
             continue
         cursor += 1
