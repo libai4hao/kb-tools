@@ -10,7 +10,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "md_pull_images.py"
@@ -127,7 +129,7 @@ class PullImagesTest(unittest.TestCase):
 
             dry = self._run(str(nested), "--dry-run")
             self.assertEqual(dry.returncode, 0, dry.stderr)
-            self.assertIn("2 张远程图片", dry.stdout.replace("共 2 个文件 / ", ""))
+            self.assertIn("2 张唯一远程图片", dry.stdout)
 
             proc = self._run(str(nested), "--rewrite")
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
@@ -140,6 +142,161 @@ class PullImagesTest(unittest.TestCase):
     def test_missing_target(self):
         proc = self._run("definitely-not-here.md")
         self.assertEqual(proc.returncode, 2)
+
+
+# ---------------------------------------------------------------- 同源限流
+
+
+class _TrackingHandler(http.server.SimpleHTTPRequestHandler):
+    """记录并发峰值与请求起始时刻，用来验证限流真的生效。"""
+
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+    delay = 0.08
+
+    @classmethod
+    def reset(cls):
+        with cls.lock:
+            cls.active = 0
+            cls.peak = 0
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        with _TrackingHandler.lock:
+            _TrackingHandler.active += 1
+            _TrackingHandler.peak = max(_TrackingHandler.peak, _TrackingHandler.active)
+        try:
+            time.sleep(_TrackingHandler.delay)
+            super().do_GET()
+        finally:
+            with _TrackingHandler.lock:
+                _TrackingHandler.active -= 1
+
+
+def _serve(directory: Path, handler_cls) -> tuple[socketserver.ThreadingTCPServer, str]:
+    port = _free_port()
+    server = socketserver.ThreadingTCPServer(
+        ("127.0.0.1", port),
+        lambda *a, **kw: handler_cls(*a, directory=str(directory), **kw),
+    )
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{port}"
+
+
+@contextmanager
+def _second_server():
+    """第二个“站点”，用来验证跨源并行 / 同站合并。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "pic").mkdir()
+        for i in range(2):
+            (root / "pic" / f"{i}.png").write_bytes(PNG_1PX)
+        server, base = _serve(root, _TrackingHandler)
+        try:
+            yield base
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+_FOUR_IMAGES = (
+    "![a]({a}/pic/0.png)\n\n![b]({a}/pic/1.png)\n\n"
+    "![c]({b}/pic/0.png)\n\n![d]({b}/pic/1.png)\n"
+)
+
+
+class ThrottleTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.tmp.name)
+        (cls.root / "pic").mkdir(parents=True)
+        for i in range(9):
+            (cls.root / "pic" / f"{i}.png").write_bytes(PNG_1PX)
+        cls.server, cls.base = _serve(cls.root, _TrackingHandler)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        _TrackingHandler.reset()
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *args],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+
+    def _md_with(self, work: str, count: int, base: str) -> Path:
+        md = Path(work) / "bulk.md"
+        lines = [f"![图{i}]({base}/pic/{i}.png)" for i in range(count)]
+        md.write_text("\n\n".join(lines), encoding="utf-8")
+        return md
+
+    def test_same_origin_is_paced_over_threshold(self):
+        with tempfile.TemporaryDirectory() as work:
+            md = self._md_with(work, 9, self.base)
+            started = time.monotonic()
+            proc = self._run(str(md), "-j", "8", "--throttle-threshold", "5",
+                             "--per-host-jobs", "2", "--per-host-interval", "0.25")
+            elapsed = time.monotonic() - started
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+
+            self.assertIn("启用同源限流", proc.stdout)
+            self.assertIn("次请求", proc.stdout)
+            # 同源并发受控：服务端观察到同时在飞的请求不超过 2
+            self.assertLessEqual(_TrackingHandler.peak, 2, f"peak={_TrackingHandler.peak}")
+            # 9 张、每源 2 并发、间隔 0.25s：至少被摊到 4 个时间片
+            self.assertGreaterEqual(elapsed, 0.9, f"elapsed={elapsed:.2f}s")
+            self.assertEqual(len(list((Path(work) / "bulk.assets").iterdir())), 9)
+
+    def test_below_threshold_is_not_paced(self):
+        with tempfile.TemporaryDirectory() as work:
+            md = self._md_with(work, 3, self.base)
+            proc = self._run(str(md), "-j", "8")
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertNotIn("同源限流", proc.stdout)
+            self.assertGreaterEqual(_TrackingHandler.peak, 2, "小幅批量应保持并行")
+
+    def test_different_origins_run_in_parallel(self):
+        with _second_server() as other_base:
+            with tempfile.TemporaryDirectory() as work:
+                md = Path(work) / "two-sites.md"
+                md.write_text(_FOUR_IMAGES.format(a=self.base, b=other_base),
+                              encoding="utf-8")
+                started = time.monotonic()
+                proc = self._run(str(md), "--throttle-threshold", "3",
+                                 "--per-host-jobs", "1", "--per-host-interval", "0.3")
+                elapsed = time.monotonic() - started
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertEqual(proc.stdout.count("[ok]"), 4)
+                # 一个源串行要 0.3s+；两个源各自串行应并行，总时间接近单源
+                self.assertLess(elapsed, 0.9, f"elapsed={elapsed:.2f}s")
+
+    def test_site_scope_merges_buckets(self):
+        # 本地用不同端口模拟同一站点下的多个子域图床
+        with _second_server() as other_base:
+            with tempfile.TemporaryDirectory() as work:
+                md = Path(work) / "same-site.md"
+                md.write_text(_FOUR_IMAGES.format(a=self.base, b=other_base),
+                              encoding="utf-8")
+                started = time.monotonic()
+                proc = self._run(str(md), "--throttle-threshold", "3",
+                                 "--per-host-jobs", "1", "--per-host-interval", "0.3",
+                                 "--throttle-scope", "site")
+                elapsed = time.monotonic() - started
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertEqual(proc.stdout.count("[ok]"), 4)
+                self.assertIn("启用同站限流", proc.stdout)
+                # 合并成一个桶后 4 个请求串行：3 个间隔 ≈ 0.9s，明显慢于按源并行
+                self.assertGreaterEqual(elapsed, 0.85, f"elapsed={elapsed:.2f}s")
 
 
 if __name__ == "__main__":

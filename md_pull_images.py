@@ -15,6 +15,10 @@
     python md_pull_images.py 排序算法.md
     python md_pull_images.py 排序算法.md --rewrite
     python md_pull_images.py ./notes --rewrite --assets-dir assets
+    python md_pull_images.py ./notes --rewrite --throttle-scope site --per-host-interval 0.6
+
+批量拉取时，图片总数超过 --throttle-threshold（默认 20）会自动按同源限流：
+每个源限制并发数并强制请求间隔，避免被图床按 IP 限速。
 """
 
 from __future__ import annotations
@@ -22,12 +26,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import random
 import re
 import sys
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -104,6 +112,100 @@ def normalize_url(url: str) -> str:
     return url
 
 
+def origin_of(url: str) -> str:
+    """同源判定用的键：协议 + 主机 + 端口。"""
+    parts = urllib.parse.urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}".lower()
+
+
+_IPV4_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+
+
+def throttle_key(url: str, scope: str = "origin") -> str:
+    """限流分桶键。
+
+    origin：严格同源（协议+主机+端口），默认；
+    site：同站点，按主机名后两段合并，img1.example.com 与 img2.example.com 视为一家，
+          适合 cnblogs 这类把图片分散在多个子域图床的站点。
+    """
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if scope == "site":
+        if _IPV4_RE.match(host) or host.count(".") < 1:
+            return host
+        return ".".join(host.split(".")[-2:])
+    return f"{parts.scheme}://{parts.netloc}".lower()
+
+
+# ---------------------------------------------------------------- 同源限流
+
+
+class HostThrottle:
+    """按同源（scheme://host[:port]）控制拉取节奏。
+
+    两道限制同时生效：
+    1. 同源并发上限：每个源最多 max_concurrent 个请求同时在飞；
+    2. 同源最小间隔：同一个源相邻两次请求的发起时间至少隔 interval 秒，
+       再叠加一点随机抖动，避免整齐的脉冲式流量。
+
+    不同源之间互不影响，所以多站点笔记库仍然可以并行拉取。
+    """
+
+    def __init__(self, max_concurrent: int = 3, interval: float = 0.4,
+                 jitter: float = 0.15):
+        self.max_concurrent = max(1, max_concurrent)
+        self.interval = max(0.0, interval)
+        self.jitter = max(0.0, jitter)
+        self._guard = threading.Lock()
+        self._sems: dict[str, threading.Semaphore] = {}
+        self._next_start: dict[str, float] = {}
+        self.stats: dict[str, int] = {}   # 源 -> 已发请求数
+        self.waited = 0.0                  # 累计因限流而等待的秒数
+
+    def _semaphore(self, origin: str) -> threading.Semaphore:
+        with self._guard:
+            sem = self._sems.get(origin)
+            if sem is None:
+                sem = threading.Semaphore(self.max_concurrent)
+                self._sems[origin] = sem
+                self._next_start[origin] = 0.0
+            self.stats[origin] = self.stats.get(origin, 0) + 1
+            return sem
+
+    def slot(self, origin: str):
+        """占一个同源请求位；退出上下文时归还。返回 context manager。"""
+        return _HostSlot(self, origin)
+
+
+class _HostSlot:
+    def __init__(self, throttle: HostThrottle, origin: str):
+        self.throttle = throttle
+        self.origin = origin
+        self._sem = None
+
+    def __enter__(self):
+        th = self.throttle
+        self._sem = th._semaphore(self.origin)
+        self._sem.acquire()
+        try:
+            with th._guard:
+                start_at = max(time.monotonic(), th._next_start.get(self.origin, 0.0))
+                gap = th.interval + random.uniform(0, th.jitter)
+                th._next_start[self.origin] = start_at + gap
+            delay = start_at - time.monotonic()
+            if delay > 0:
+                th.waited += delay
+                time.sleep(delay)
+        except BaseException:
+            self._sem.release()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._sem.release()
+        return False
+
+
 # ---------------------------------------------------------------- 下载与命名
 
 
@@ -135,27 +237,51 @@ class FetchResult:
     error: str = ""
 
 
-def fetch(url: str, timeout: float, retries: int, referer: str | None) -> FetchResult:
+def _parse_retry_after(value: str | None) -> float | None:
+    """解析 Retry-After：秒数直接用，HTTP-date 之类退化成固定等待。"""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value.strip()))
+    except ValueError:
+        return 5.0
+
+
+def _request(url: str, timeout: float, referer: str | None) -> tuple[bytes, str]:
+    req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
+    if referer:
+        req.add_header("Referer", referer)
+    else:
+        parts = urllib.parse.urlsplit(url)
+        req.add_header("Referer", f"{parts.scheme}://{parts.netloc}/")
+    req.add_header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(), resp.headers.get("Content-Type", "")
+
+
+def fetch(url: str, timeout: float, retries: int, referer: str | None,
+          throttle: "HostThrottle | None" = None, key: str | None = None) -> FetchResult:
     last_error = ""
+    bucket = key or origin_of(url)
     for attempt in range(retries + 1):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
-            if referer:
-                req.add_header("Referer", referer)
-            else:
-                parts = urllib.parse.urlsplit(url)
-                req.add_header("Referer", f"{parts.scheme}://{parts.netloc}/")
-            req.add_header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = resp.read()
-                ctype = resp.headers.get("Content-Type", "")
+            slot = throttle.slot(bucket) if throttle is not None else nullcontext()
+            with slot:  # 同源限流在这里生效：并发位 + 最小间隔
+                data, ctype = _request(url, timeout, referer)
             if not data:
                 raise IOError("响应为空")
             return FetchResult(url, data, ctype)
         except Exception as exc:  # noqa: BLE001 - 网络异常种类很多，统一记录
             last_error = f"{type(exc).__name__}: {exc}"
             if attempt < retries:
-                time.sleep(min(2 ** attempt, 5))
+                delay = None
+                if isinstance(exc, urllib.error.HTTPError) and exc.code in (429, 503):
+                    delay = _parse_retry_after(
+                        exc.headers.get("Retry-After") if exc.headers else None
+                    )
+                if delay is None:
+                    delay = min(2 ** attempt, 5)
+                time.sleep(min(delay, 30))
     return FetchResult(url, error=last_error)
 
 
@@ -188,6 +314,7 @@ def process_file(
     assets_dir: Path,
     args: argparse.Namespace,
     used_names: dict[str, str],
+    throttle: "HostThrottle | None" = None,
 ) -> FileReport:
     text = read_text(md_path)
     hits = iter_hits(text)
@@ -206,10 +333,12 @@ def process_file(
 
     remote_urls = list(unique)
     results: dict[str, FetchResult] = {}
+    keys = {u: throttle_key(u, args.throttle_scope) for u in remote_urls}
     if args.jobs > 1 and len(remote_urls) > 1:
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
             futures = {
-                pool.submit(fetch, u, args.timeout, args.retries, args.referer): u
+                pool.submit(fetch, u, args.timeout, args.retries,
+                            args.referer, throttle, keys[u]): u
                 for u in remote_urls
             }
             for fut in as_completed(futures):
@@ -220,7 +349,8 @@ def process_file(
                     results[url] = FetchResult(url, error=str(exc))
     else:
         for url in remote_urls:
-            results[url] = fetch(url, args.timeout, args.retries, args.referer)
+            results[url] = fetch(url, args.timeout, args.retries, args.referer,
+                                 throttle, keys[url])
 
     mapping: dict[str, str] = {}
     assets_dir.mkdir(parents=True, exist_ok=True)
@@ -314,6 +444,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retries", type=int, default=2, help="失败重试次数，默认 2")
     parser.add_argument("--referer", default=None,
                         help="自定义 Referer；默认使用图片域名首页，用于绕过防盗链")
+    parser.add_argument("--throttle-threshold", type=int, default=20,
+                        help="远程图片总数超过该值时启用同源限流，默认 20；0 表示始终启用")
+    parser.add_argument("--throttle-scope", choices=("origin", "site"), default="origin",
+                        help="限流分桶粒度：origin=严格同源（默认），site=按域名后两段合并同站子域")
+    parser.add_argument("--per-host-jobs", type=int, default=3,
+                        help="同源并发上限，默认 3")
+    parser.add_argument("--per-host-interval", type=float, default=0.4,
+                        help="同源相邻请求最小间隔秒，默认 0.4")
+    parser.add_argument("--no-throttle", action="store_true",
+                        help="关闭同源限流（小批量或自建图床时用）")
     parser.add_argument("--dry-run", action="store_true", help="只列出待下载的图片，不落盘")
     parser.add_argument("-q", "--quiet", action="store_true", help="只输出汇总")
     parser.set_defaults(recursive=True)
@@ -334,17 +474,39 @@ def main(argv: list[str] | None = None) -> int:
         print(f"没找到 Markdown 文件: {target}", file=sys.stderr)
         return 2
 
+    # 先摸清全局待拉取图片数量，决定是否启用同源限流
+    all_urls: set[str] = set()
+    per_file: dict[Path, list[str]] = {}
+    for md in files:
+        urls = sorted(
+            {normalize_url(h.url) for h in iter_hits(read_text(md)) if is_remote(h.url)}
+        )
+        per_file[md] = urls
+        all_urls.update(urls)
+    throttle_needed = (
+        not args.no_throttle
+        and (len(all_urls) > args.throttle_threshold or args.throttle_threshold <= 0)
+    )
+
     if args.dry_run:
-        total = 0
         for md in files:
-            hits = [normalize_url(h.url) for h in iter_hits(read_text(md)) if is_remote(h.url)]
-            uniq = sorted(set(hits))
-            total += len(uniq)
-            print(f"{md}: {len(uniq)} 张远程图片")
-            for url in uniq:
+            print(f"{md}: {len(per_file[md])} 张远程图片")
+            for url in per_file[md]:
                 print(f"  - {url}")
-        print(f"\n共 {len(files)} 个文件 / {total} 张远程图片（dry-run，未下载）")
+        print(f"\n共 {len(files)} 个文件 / {len(all_urls)} 张唯一远程图片（dry-run，未下载）")
+        if throttle_needed:
+            print(f"预计启用同源限流：每源并发 ≤ {args.per_host_jobs}，"
+                  f"相邻间隔 ≥ {args.per_host_interval}s")
         return 0
+
+    throttle = None
+    if throttle_needed:
+        throttle = HostThrottle(args.per_host_jobs, args.per_host_interval)
+        if not args.quiet:
+            scope_text = "同源" if args.throttle_scope == "origin" else "同站"
+            print(f"远程图片 {len(all_urls)} 张，超过阈值 {args.throttle_threshold}，"
+                  f"启用{scope_text}限流：每桶并发 ≤ {args.per_host_jobs}，"
+                  f"同桶间隔 ≥ {args.per_host_interval}s（含抖动）")
 
     is_single = target.is_file()
     reports: list[FileReport] = []
@@ -358,7 +520,7 @@ def main(argv: list[str] | None = None) -> int:
                 else md.parent / f"{md.stem}.assets"
         if not args.quiet:
             print(f"\n>> {md}  (assets -> {assets_dir})")
-        reports.append(process_file(md, assets_dir, args, used_names))
+        reports.append(process_file(md, assets_dir, args, used_names, throttle))
 
     # 汇总
     ok = sum(len(r.downloaded) for r in reports)
@@ -374,6 +536,11 @@ def main(argv: list[str] | None = None) -> int:
         for url, err in r.failed:
             print(f"  [fail] {url}  ({err})")
     print(f"合计：下载 {ok} / 已存在 {kept} / 失败 {bad}")
+    if throttle is not None and throttle.stats:
+        print(f"限流：{len(throttle.stats)} 个桶，等待合计 {throttle.waited:.1f}s"
+              f"（并发场景按各请求累加，非实际墙钟）")
+        for bucket, count in sorted(throttle.stats.items(), key=lambda kv: -kv[1]):
+            print(f"  {bucket}: {count} 次请求")
     return 1 if bad else 0
 
 
