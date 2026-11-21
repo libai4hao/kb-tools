@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import base64
 import http.server
+import os
 import re
 import socket
 import socketserver
@@ -14,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from contextlib import contextmanager
@@ -246,6 +248,16 @@ Inline `![inline](https://example.test/inline.png)` should be ignored.
                 ast.parse(path.read_text(encoding="utf-8"), filename=str(path),
                           feature_version=(3, 8))
 
+    def test_html_code_blocks_and_escaped_images_are_ignored(self):
+        text = (
+            "<pre>\n![a](https://e.test/pre.png)\n</pre>\n"
+            "<code>![b](https://e.test/code.png)</code>\n"
+            "\\![c](https://e.test/escaped.png)\n"
+            "![d](https://e.test/real.png)\n"
+        )
+        self.assertEqual([hit.url for hit in pull_images.iter_hits(text)],
+                         ["https://e.test/real.png"])
+
 
 class _CountingHtmlHandler(http.server.SimpleHTTPRequestHandler):
     lock = threading.Lock()
@@ -305,6 +317,73 @@ class RewriteAndCollisionTest(unittest.TestCase):
             self.assertNotIn("stale.assets/a.png)", rewritten)
             self.assertRegex(rewritten, r"stale\.assets/a-[0-9a-f]{12}\.png\)")
             self.assertTrue((assets / ".md_pull_images-manifest.json").is_file())
+
+    def test_filenames_with_spaces_and_parentheses_get_valid_links(self):
+        with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as root:
+            (Path(root) / "pic").mkdir()
+            for name in ("a b.png", "plot_(1).png", "half(1.png"):
+                (Path(root) / "pic" / name).write_bytes(PNG_1PX)
+            server, base = _serve(Path(root), _Handler)
+            try:
+                md = Path(work) / "names.md"
+                md.write_text(
+                    f"![a]({base}/pic/a%20b.png)\n"
+                    f"![b]({base}/pic/plot_(1).png)\n"
+                    f"![c]({base}/pic/half%281.png)\n",
+                    encoding="utf-8",
+                )
+                proc = self._run(str(md), "--rewrite")
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                text = md.read_text(encoding="utf-8")
+                # 空格会把链接目标截断，回写时必须百分号编码
+                self.assertIn("![a](names.assets/a%20b.png)", text)
+                # 成对括号不影响解析，保持可读
+                self.assertIn("![b](names.assets/plot_(1).png)", text)
+                # 不成对括号会让链接在第一个 ) 处结束，必须编码
+                self.assertIn("![c](names.assets/half%281.png)", text)
+                self.assertTrue((Path(work) / "names.assets" / "a b.png").is_file())
+                self.assertTrue((Path(work) / "names.assets" / "half(1.png").is_file())
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_cross_drive_assets_dir_reports_failure_instead_of_rewriting(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            md = Path(work) / "drive.md"
+            original = f"![a]({base}/pic/a.png)"
+            md.write_text(original, encoding="utf-8")
+            args = pull_images.build_parser().parse_args(
+                [str(md), "--rewrite", "--allow-private-addresses", "-q"]
+            )
+            assets = Path(work) / "drive.assets"
+            with mock.patch("md_pull_images.os.path.relpath",
+                            side_effect=ValueError("path is on mount 'C:', start on mount 'D:'")):
+                report = pull_images.process_file(md, assets, args, {})
+            self.assertTrue(report.failed)
+            self.assertIn("不在同一盘符", report.failed[0][1])
+            self.assertEqual(md.read_text(encoding="utf-8"), original)
+            self.assertTrue((assets / "a.png").is_file())
+            self.assertFalse(report.rewritten)
+
+    def test_read_only_markdown_fails_soft_and_batch_continues(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            locked = Path(work) / "locked.md"
+            locked.write_text(f"![a]({base}/pic/a.png)", encoding="utf-8")
+            ok = Path(work) / "ok.md"
+            ok.write_text(f"![a]({base}/pic/a.png)", encoding="utf-8")
+            os.chmod(locked, 0o444)
+            if os.access(locked, os.W_OK):
+                os.chmod(locked, 0o666)
+                self.skipTest("当前平台未强制只读权限")
+            try:
+                proc = self._run(str(Path(work)), "--rewrite")
+            finally:
+                os.chmod(locked, 0o666)
+            self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
+            self.assertNotIn("Traceback", proc.stderr, proc.stderr)
+            self.assertIn("回写失败", proc.stdout)
+            # 前一个文件失败不应影响后续文件
+            self.assertIn("ok.assets/a.png", ok.read_text(encoding="utf-8"))
 
     def test_different_urls_with_same_basename_do_not_overwrite(self):
         with tempfile.TemporaryDirectory() as work, \
@@ -598,8 +677,10 @@ class ThrottleTest(unittest.TestCase):
             self.assertLessEqual(_TrackingHandler.peak, 2, f"peak={_TrackingHandler.peak}")
             arrivals = sorted(stamp for port, stamp in _TrackingHandler.starts)
             self.assertEqual(len(arrivals), 9)
-            self.assertGreaterEqual(min(b - a for a, b in zip(arrivals, arrivals[1:])), 0.24)
-            # 9 张、每源 2 并发、间隔 0.25s：至少被摊到 4 个时间片
+            # 相邻到达间隔会被线程调度抖动吃掉几十毫秒，用首末跨度判“是否被摊开”：
+            # 9 张、每源 2 并发、间隔 0.25s 理论跨度约 1.0s，未限流时只有 0.1s 级。
+            self.assertGreaterEqual(arrivals[-1] - arrivals[0], 0.7,
+                                    f"span={arrivals[-1] - arrivals[0]:.2f}s")
             self.assertGreaterEqual(elapsed, 0.9, f"elapsed={elapsed:.2f}s")
             self.assertEqual(len([p for p in (Path(work) / "bulk.assets").iterdir() if not p.name.startswith(".")]), 9)
 
@@ -639,16 +720,20 @@ class ThrottleTest(unittest.TestCase):
                 md = Path(work) / "same-site.md"
                 md.write_text(_FOUR_IMAGES.format(a=self.base, b=other_base),
                               encoding="utf-8")
-                started = time.monotonic()
                 proc = self._run(str(md), "--throttle-threshold", "3",
                                  "--per-host-jobs", "1", "--per-host-interval", "0.3",
                                  "--throttle-scope", "site")
-                elapsed = time.monotonic() - started
                 self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
                 self.assertEqual(proc.stdout.count("[ok]"), 4)
                 self.assertIn("启用同站限流", proc.stdout)
-                # 合并成一个桶后 4 个请求串行：3 个间隔 ≈ 0.9s，明显慢于按源并行
-                self.assertGreaterEqual(elapsed, 0.85, f"elapsed={elapsed:.2f}s")
+                # 判据放在服务端：合并成一个桶后 4 个请求必须串行（峰值 1、
+                # 首末跨度 ≥ 0.7s）。用跨度而不是相邻最小间隔，避免被调度抖动误伤。
+                arrivals = sorted(stamp for port, stamp in _TrackingHandler.starts)
+                self.assertEqual(len(arrivals), 4)
+                self.assertEqual(_TrackingHandler.peak, 1,
+                                 f"peak={_TrackingHandler.peak}")
+                self.assertGreaterEqual(arrivals[-1] - arrivals[0], 0.7,
+                                        f"span={arrivals[-1] - arrivals[0]:.2f}s")
 
 
 if __name__ == "__main__":

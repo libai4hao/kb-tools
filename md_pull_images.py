@@ -93,12 +93,16 @@ def _mask_span(chars: list[str], start: int, end: int) -> None:
 
 
 def _mask_markdown_code(text: str) -> str:
-    'Mask fenced/indented code, inline code spans and HTML comments.'
+    'Mask fenced/indented code, inline code spans, <pre>/<code> blocks and HTML comments.'
     chars = list(text)
     # Mask comments before looking for fences so copied fence markers inside
     # comments cannot accidentally hide the rest of the Markdown document.
     for comment in re.finditer(r"<!--.*?-->", text, re.DOTALL):
         _mask_span(chars, comment.start(), comment.end())
+    # Raw HTML code blocks (<pre>) and inline code (<code>) are code too;
+    # images inside them must not be downloaded or rewritten.
+    for block in re.finditer(r"<(pre|code)\b[^>]*>.*?</\1\s*>", text, re.IGNORECASE | re.DOTALL):
+        _mask_span(chars, block.start(), block.end())
     scan_source = "".join(chars)
     offset = 0
     fence_char = ""
@@ -188,6 +192,14 @@ def _markdown_unescape(value: str) -> str:
 def _markdown_inline_image_hits(text: str, masked: str) -> list[ImageHit]:
     hits: list[ImageHit] = []
     for match in re.finditer(r"!\[", masked):
+        # "\![a](b.png)" 是转义后的字面文本，不是图片。
+        slashes = 0
+        probe = match.start() - 1
+        while probe >= 0 and masked[probe] == "\\":
+            slashes += 1
+            probe -= 1
+        if slashes % 2:
+            continue
         alt_start = match.end() - 1
         alt_end = _find_closing_bracket(masked, alt_start)
         if alt_end < 0:
@@ -882,6 +894,27 @@ def read_text(path: Path) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def _markdown_path(path: str) -> str:
+    """把本地路径写成 Markdown 链接目标。
+
+    空格、`#`、`%`、尖括号会被 Markdown/URL 解析截断或当成片段，需要百分号
+    编码；括号成对时按原样写，不成对才编码，避免链接在第一个 `)` 处提前结束。
+    """
+    path = (path.replace("%", "%25").replace(" ", "%20").replace("#", "%23")
+            .replace("<", "%3C").replace(">", "%3E"))
+    if path.count("(") != path.count(")"):
+        path = path.replace("(", "%28").replace(")", "%29")
+    return path
+
+
+def _relative_asset_dir(assets_dir: Path, md_parent: Path) -> Path | None:
+    """相对链接的基准目录；Windows 上跨盘符无法表示相对路径，返回 None。"""
+    try:
+        return Path(os.path.relpath(assets_dir, md_parent))
+    except ValueError:
+        return None
+
+
 def process_file(
     md_path: Path,
     assets_dir: Path,
@@ -989,7 +1022,12 @@ def process_file(
 
     # 回写 Markdown
     if args.rewrite and mapping:
-        rel = Path(os.path.relpath(assets_dir, md_path.parent))
+        rel = _relative_asset_dir(assets_dir, md_path.parent)
+        if rel is None:
+            report.failed.append(
+                (str(md_path), "图片目录与 Markdown 不在同一盘符，无法生成相对链接，已跳过回写")
+            )
+            return report
         # 同一 (start, end) 只能对应一个替换文本；出现分歧说明解析出的区间
         # 互相覆盖，宁可整篇不回写，也不要把两份内容拼到同一段文本上。
         spans_by_range: dict[tuple[int, int], str] = {}
@@ -998,7 +1036,7 @@ def process_file(
             local = mapping.get(url)
             if not local:
                 continue
-            new_text = (rel / local).as_posix()
+            new_text = _markdown_path((rel / local).as_posix())
             for hit in hits_for_url:
                 span = (hit.start, hit.end)
                 if spans_by_range.setdefault(span, new_text) != new_text:
@@ -1025,12 +1063,18 @@ def process_file(
                 out.append(text[cursor:])
                 new_content = "".join(out)
                 if new_content != text:
-                    if args.backup:
-                        bak = md_path.with_suffix(md_path.suffix + ".bak")
-                        if not bak.exists():
-                            _atomic_write_bytes(bak, md_path.read_bytes())
-                    _atomic_write_text(md_path, new_content, encoding="utf-8")
-                    report.rewritten = True
+                    try:
+                        if args.backup:
+                            bak = md_path.with_suffix(md_path.suffix + ".bak")
+                            if not bak.exists():
+                                _atomic_write_bytes(bak, md_path.read_bytes())
+                        _atomic_write_text(md_path, new_content, encoding="utf-8")
+                    except OSError as exc:
+                        report.failed.append(
+                            (str(md_path), f"Markdown 回写失败: {type(exc).__name__}: {exc}")
+                        )
+                    else:
+                        report.rewritten = True
     return report
 
 
@@ -1165,7 +1209,13 @@ def main(argv: list[str] | None = None) -> int:
                 else md.parent / f"{md.stem}.assets"
         if not args.quiet:
             print(f"\n>> {md}  (assets -> {assets_dir})")
-        reports.append(process_file(md, assets_dir, args, used_names, throttle))
+        try:
+            reports.append(process_file(md, assets_dir, args, used_names, throttle))
+        except Exception as exc:  # noqa: BLE001 - 单个文件出错不应中断整批
+            failed = FileReport(md, assets_dir)
+            failed.failed.append((str(md), f"处理失败: {type(exc).__name__}: {exc}"))
+            reports.append(failed)
+            print(f"  [fail] {md}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
     # 汇总
     ok = sum(len(r.downloaded) for r in reports)
