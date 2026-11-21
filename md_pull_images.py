@@ -14,6 +14,8 @@
 默认行为是「只下载不改文件」，加 --rewrite 才把远程链接替换成本地相对路径
 （回写统一按 UTF-8，链接里的空格 / # / % 等会做百分号编码）。图片目录里维护
 .md_pull_images-manifest.json 记录 URL 与文件名的对应，避免误用同名旧文件。
+每张图下载完就写入资产目录的 .mdpull-*.part 临时文件，命名确定后再原子改名，
+所以内存峰值只与 --jobs 和单图上限有关，不随批量总量增长。
 
 安全与限流默认值：单张上限 25 MiB，私网/回环/元数据地址默认拒绝（需
 --allow-private-addresses），远程图片总数超过 --throttle-threshold（默认 20）
@@ -508,7 +510,8 @@ class _HostSlot:
                 th._next_start[self.origin] = start_at + gap
             delay = start_at - time.monotonic()
             if delay > 0:
-                th.waited += delay
+                with th._guard:
+                    th.waited += delay
                 time.sleep(delay)
         except BaseException:
             self._sem.release()
@@ -545,6 +548,37 @@ def guess_name(
     if len(stem) > 80:
         stem = stem[:64] + "-" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
     return stem + ext
+
+
+def _write_spool(directory: Path, data: bytes) -> Path:
+    """把下载到内存的字节立刻落到临时文件，调用方随后只保留路径。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".mdpull-", suffix=".part", dir=str(directory))
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+    return Path(temp_name)
+
+
+def _commit_spool(spool: Path, target: Path) -> None:
+    """把临时文件原子改名成最终文件（两者同目录，必然同卷）。"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(str(spool), str(target))
+
+
+def _unlink_quiet(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -668,6 +702,15 @@ class FetchResult:
     content_type: str = ""
     error: str = ""
     image_ext: str = ""
+    # 指定 spool_dir 时，图片先落到该目录的临时文件，这里只保留路径，
+    # 避免成批图片的字节全部同时留在内存里。
+    path: Path | None = None
+
+
+def _cleanup_spools(results: dict[str, FetchResult]) -> None:
+    """清掉没被 os.replace 消费的临时文件：下载失败、已跳过、提前返回都走这里。"""
+    for res in results.values():
+        _unlink_quiet(res.path)
 
 
 class NonRetryableError(Exception):
@@ -813,7 +856,8 @@ def _request(
         "application/octet-stream", "binary/octet-stream"
     ):
         raise NonRetryableError(f"响应 Content-Type 不是图片类型: {mime}")
-    image_ext = _detect_image_extension(bytes(data))
+    payload = bytes(data)
+    image_ext = _detect_image_extension(payload)
     if not image_ext:
         raise NonRetryableError(f"响应内容不是受支持的图片格式 (Content-Type: {content_type or 'unknown'})")
     expected_ext = CONTENT_TYPE_EXT.get(mime)
@@ -822,7 +866,7 @@ def _request(
         raise NonRetryableError(
             f"图片 MIME 类型与文件内容不匹配 (Content-Type: {mime}, 实际格式: {image_ext})"
         )
-    return bytes(data), content_type, image_ext
+    return payload, content_type, image_ext
 
 
 def fetch(
@@ -834,6 +878,7 @@ def fetch(
     key: str | None = None,
     max_bytes: int = 25 * 1024 * 1024,
     allow_private_addresses: bool = False,
+    spool_dir: Path | None = None,
 ) -> FetchResult:
     if retries < 0:
         return FetchResult(url, error="ValueError: retries 必须大于等于 0")
@@ -855,6 +900,9 @@ def fetch(
                 )
             if not data:
                 raise IOError("响应为空")
+            if spool_dir is not None:
+                return FetchResult(url, None, ctype, image_ext=image_ext,
+                                   path=_write_spool(spool_dir, data))
             return FetchResult(url, data, ctype, image_ext=image_ext)
         except Exception as exc:  # noqa: BLE001 - 网络异常种类很多，统一记录
             last_error = f"{type(exc).__name__}: {exc}"
@@ -943,6 +991,7 @@ def process_file(
         return report
 
     remote_urls = list(unique)
+    assets_dir.mkdir(parents=True, exist_ok=True)  # 下载临时文件就落在这里
     results: dict[str, FetchResult] = {}
     keys: dict[str, str] = {}
     for url in remote_urls:
@@ -956,7 +1005,7 @@ def process_file(
             futures = {
                 pool.submit(fetch, u, args.timeout, args.retries,
                             args.referer, throttle, keys[u], args.max_image_size,
-                            args.allow_private_addresses): u
+                            args.allow_private_addresses, assets_dir): u
                 for u in remote_urls
             }
             for fut in as_completed(futures):
@@ -969,11 +1018,10 @@ def process_file(
         for url in remote_urls:
             results[url] = fetch(
                 url, args.timeout, args.retries, args.referer, throttle, keys[url],
-                args.max_image_size, args.allow_private_addresses,
+                args.max_image_size, args.allow_private_addresses, assets_dir,
             )
 
     mapping: dict[str, str] = {}
-    assets_dir.mkdir(parents=True, exist_ok=True)
     original_manifest = _load_manifest(assets_dir)
     manifest = dict(original_manifest)
     owners = {name.casefold(): url for url, name in manifest.items()}
@@ -989,6 +1037,7 @@ def process_file(
             assets_dir, url, name, manifest, owners, used_names, args.overwrite
         )
         if should_skip:
+            _unlink_quiet(res.path)  # 已有可用文件，不再保留这次下载的临时文件
             report.skipped.append(url)
             mapping[url] = target.name
             used_names[_path_key(target)] = url
@@ -1004,8 +1053,12 @@ def process_file(
     successfully_written: list[tuple[str, Path]] = []
     for url, res, target in pending_writes:
         try:
-            _atomic_write_bytes(target, res.data or b"")
+            if res.path is not None:
+                _commit_spool(res.path, target)
+            else:
+                _atomic_write_bytes(target, res.data or b"")
         except OSError as exc:
+            _unlink_quiet(res.path)
             report.failed.append((url, f"资产写入失败: {type(exc).__name__}: {exc}"))
             continue
         manifest[url] = target.name
@@ -1032,6 +1085,7 @@ def process_file(
             report.failed.append(
                 (str(md_path), "图片目录与 Markdown 不在同一盘符，无法生成相对链接，已跳过回写")
             )
+            _cleanup_spools(results)
             return report
         # 同一 (start, end) 只能对应一个替换文本；出现分歧说明解析出的区间
         # 互相覆盖，宁可整篇不回写，也不要把两份内容拼到同一段文本上。
@@ -1080,6 +1134,7 @@ def process_file(
                         )
                     else:
                         report.rewritten = True
+    _cleanup_spools(results)
     return report
 
 

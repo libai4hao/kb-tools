@@ -736,6 +736,56 @@ class ThrottleTest(unittest.TestCase):
                                         f"span={arrivals[-1] - arrivals[0]:.2f}s")
 
 
+class StreamingAndSyntaxTest(unittest.TestCase):
+    """图片边下边落盘，以及 `![a] (url)` 这类非图片写法。"""
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--allow-private-addresses", *args],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+
+    def test_spool_files_are_cleaned_after_success(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            md = Path(work) / "ok.md"
+            md.write_text(
+                f"![a]({base}/pic/a.png)\n![b]({base}/pic/b.png)\n![c]({base}/pic/same.png)\n",
+                encoding="utf-8",
+            )
+            proc = self._run(str(md), "--rewrite")
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            assets = Path(work) / "ok.assets"
+            self.assertEqual(list(assets.glob(".mdpull-*")), [], "临时文件应已改名或清理")
+            self.assertEqual(sorted(p.name for p in assets.glob("*.png")),
+                             ["a.png", "b.png", "same.png"])
+            self.assertIn("ok.assets/a.png", md.read_text(encoding="utf-8"))
+
+    def test_spool_files_are_cleaned_after_failure(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            md = Path(work) / "mix.md"
+            md.write_text(
+                f"![a]({base}/pic/a.png)\n![x]({base}/pic/missing.png)\n",
+                encoding="utf-8",
+            )
+            proc = self._run(str(md))
+            self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
+            assets = Path(work) / "mix.assets"
+            self.assertEqual(list(assets.glob(".mdpull-*")), [], "失败项不应留下临时文件")
+            self.assertTrue((assets / "a.png").is_file())
+
+    def test_fetch_spools_to_disk_and_reports_path(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            res = pull_images.fetch(
+                f"{base}/pic/a.png", 2.0, 0, None,
+                max_bytes=4 * 1024 * 1024, allow_private_addresses=True,
+                spool_dir=Path(work),
+            )
+            self.assertEqual(res.error, "")
+            self.assertIsNone(res.data, "落盘后不应继续持有图片字节")
+            self.assertIsNotNone(res.path)
+            self.assertEqual(res.path.read_bytes(), PNG_1PX)
+
+
 README = SCRIPT.parent / "README.md"
 
 
