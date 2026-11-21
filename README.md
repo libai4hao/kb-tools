@@ -25,7 +25,7 @@
 - `<img src="https://.../b.gif" width="120" />`
 - 引用式：`![alt][ref]` + `[ref]: https://.../c.jpg`（也支持 `![ref][]` 折写）
 
-只下载 `http(s)` 与 `//` 协议开头的图片；已经是本地相对路径、绝对路径、`data:` URI 的图片会原样跳过。
+解析时会忽略围栏代码块、缩进代码、行内代码和 HTML 注释中的示例；Markdown 图片 URL 支持平衡括号，HTML 图片只读取真正的 `src` 属性（不会把 `data-src` 当成 `src`）。只下载 `http(s)` 与 `//` 协议开头的图片；已经是本地相对路径、绝对路径、`data:` URI 的图片会原样跳过。
 
 ### 用法
 
@@ -43,7 +43,7 @@ python md_pull_images.py ./笔记库 --rewrite
 python md_pull_images.py ./笔记库 --dry-run
 ```
 
-默认图片目录是 Markdown 同级的 `<文件名>.assets/`，回写后的链接形如 `排序算法.assets/xxx.png`，所以把 md 和 assets 目录一起搬走即可。
+默认图片目录是 Markdown 同级的 `<文件名>.assets/`，回写后的链接形如 `排序算法.assets/xxx.png`，所以把 md 和 assets 目录一起搬走即可。图片目录中会额外维护隐藏文件 `.md_pull_images-manifest.json`，记录远程 URL 与本地文件名的对应关系；只有 manifest 确认属于同一 URL 的文件才会被复用，避免把旧的同名图片误认为新图片。建议把该 manifest 与图片一起保留。
 
 ### 参数
 
@@ -53,14 +53,16 @@ python md_pull_images.py ./笔记库 --dry-run
 | `-o, --assets-dir` | 图片目录。单文件时即目标目录；目录模式时为 `<assets-dir>/<md 文件名>/` |
 | `--rewrite` | 把 md 里的远程链接替换成本地相对路径（默认只下载不改文件） |
 | `--backup` | 回写前生成 `.md.bak` |
-| `--overwrite` | 同名文件重新下载覆盖（默认已存在则跳过） |
+| `--overwrite` | 重新下载并覆盖同一 URL 在 manifest 中登记的文件；不同 URL 不会互相覆盖。对没有来源记录的旧同名文件，显式指定时仍允许覆盖 |
 | `-r, --recursive` / `--no-recursive` | 目录模式是否递归，默认递归 |
 | `-j, --jobs` | 并发下载数，默认 8 |
 | `--timeout` | 单请求超时秒数，默认 20 |
 | `--retries` | 失败重试次数，默认 2（指数退避） |
+| `--max-image-size` | 单张图片最大字节数，默认 25 MiB；先检查 Content-Length，再按流式读取限制实际大小 |
+| `--allow-private-addresses` | 允许访问本机、私有和特殊用途地址；默认拒绝，以降低不可信 Markdown 引发 SSRF 的风险 |
 | `--referer` | 自定义 Referer；不填则用图片域名首页，用于绕过常见防盗链 |
 | `--throttle-threshold` | 远程图片总数超过该值时启用限流，默认 `20`；`0` 表示始终启用 |
-| `--throttle-scope` | 限流分桶粒度：`origin`（默认，严格同源）/ `site`（按域名后两段合并同站子域） |
+| `--throttle-scope` | 限流分桶粒度：`origin`（默认，规范化协议/主机/端口）/ `site`（按可注册域名合并同站子域） |
 | `--per-host-jobs` | 同桶并发上限，默认 `3` |
 | `--per-host-interval` | 同桶相邻请求最小间隔秒，默认 `0.4` |
 | `--no-throttle` | 关闭限流（小批量、自建图床时用） |
@@ -78,12 +80,12 @@ python md_pull_images.py ./笔记库 --dry-run
 
 桶按什么划分由 `--throttle-scope` 决定：
 
-- `origin`（默认）：协议 + 主机 + 端口，严格同源。多站点笔记库可以继续跨站并行；
-- `site`：按主机名后两段归并，`img1.example.com`、`img2.example.com` 算一家。cnblogs 这类把图片分散在 `img2018` / `images2017` / `images2018` 多个子域的站点，只有用 `site` 才真正保护到「同一家的同一个配额」。
+- `origin`（默认）：协议 + 规范化主机 + 非默认端口。同一个 HTTPS 源的 `:443` 与省略端口写法会合并；多站点笔记库可以继续跨源并行；
+- `site`：按可注册域名归并子域，`img1.example.com`、`img2.example.com` 算一家；常见多级公共后缀（如 `co.uk`、`com.au`、`com.cn`）也会被单独识别。为坚持纯标准库实现，内置的是常见后缀子集，不是完整 Public Suffix List；不在内置表中的特殊后缀会回退到最后两段域名，需将其视为启发式分桶。
 
 阈值判定用的是**全局去重后的远程图片数**，不是单个文件的图片数——目录模式下一次处理 300 篇笔记也会按 300 篇的总量决定是否限流。
 
-遇到 429 / 503 时，脚本还会优先读响应里的 `Retry-After` 再重试，读不到才退回指数退避。
+遇到 429 / 503 时，脚本支持 `Retry-After` 的秒数和 HTTP-date 两种格式；无效或缺失时退回指数退避。下载会流式执行并验证图片签名和 MIME 一致性，超过 `--max-image-size` 会失败，不会把 HTML 错误页保存成图片。默认会在请求前解析 DNS，并拒绝本机、私有及特殊用途地址；重定向目标也会重新检查。若图片确实托管在内网（例如本机测试图床），需要显式使用 `--allow-private-addresses`。
 
 ```bash
 # 大库批量：同站合并、每站并发 2、间隔 0.6s
@@ -151,6 +153,11 @@ python md_pull_images.py 排序算法.md --rewrite \
 - 写作时请勿并发改同一个 md，`--rewrite` 是整文件重写；
 - 少数站点会校验 Referer + Cookie 双重防盗链，这种只能 `--referer` 加上自行处理 Cookie；
 - 限流计数在单进程内生效，同时开多个进程跑同一批站点，各自的节奏是独立的；
+- `site` 使用内置常见公共后缀子集，不等同于完整 PSL；特殊国家/地区后缀可能需要自行补充代码中的 `_MULTI_LABEL_PUBLIC_SUFFIXES`；
+- 默认私网地址拦截会影响本机/内网图床，确认来源可信后使用 `--allow-private-addresses`；DNS 预检与实际连接之间仍存在标准库 URL 客户端难以完全消除的 DNS 重绑定时间窗口，不应把它当作隔离不可信输入的唯一安全边界；
+- 内容校验基于图片文件签名与 MIME 检查，不执行完整的图像解码；当前识别 PNG/JPEG/GIF/WebP/BMP/TIFF/ICO/AVIF/SVG，HEIC、JXL 等格式会被判为不支持而失败；
+- 为避免把代码示例当图片改写，围栏代码、缩进代码、行内代码和 HTML 注释会被整体屏蔽；代价是列表项内以 4 空格缩进到「缩进代码」位置的图片也会被跳过，这类笔记请减少缩进或改用围栏外的普通段落；
+- 体积超限、Content-Type 非图片、格式与 MIME 不符这类失败不会重试；HTTP 4xx（408/429 除外）也不会重试，429/5xx/超时仍按 `--retries` 重试；
 - 重试请求同样占用限流位并计入统计，所以「次请求」可能大于图片张数。
 
 ---
@@ -174,7 +181,7 @@ kb-tools/
 python -m unittest discover -s tests -v
 ```
 
-共 9 个用例：下载+回写、不改链接、幂等、目录模式+dry-run、错误路径，以及 3 个限流用例。
+测试覆盖下载与回写、引用式重复引用、代码块与 HTML 属性解析、同名文件冲突与 manifest 幂等、数值参数边界、图片体积/内容校验、私网与重定向拦截、`Retry-After` 日期解析、URL/站点分桶规范化，以及同源限流和跨源并行。离线测试的本地 HTTP 服务显式使用 `--allow-private-addresses`。
 
 ## 贡献
 
