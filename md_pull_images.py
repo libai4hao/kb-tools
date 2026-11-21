@@ -8,17 +8,22 @@
     <img src="https://example.com/b.gif" />
     ![alt][ref]  +  [ref]: https://example.com/c.jpg
 
-只下载 http(s) 远程图片；已经是本地相对路径、data: URI、绝对路径的图片会被跳过。
-默认行为是「只下载不改文件」，加 --rewrite 才会把 Markdown 里的远程链接替换成本地相对路径。
+只下载 http(s) 与 // 开头的远程图片；本地相对路径、绝对路径、data: URI 会跳过。
+围栏代码、缩进代码、行内代码、<pre>/<code> 与 HTML 注释里的图片示例不会处理。
+
+默认行为是「只下载不改文件」，加 --rewrite 才把远程链接替换成本地相对路径
+（回写统一按 UTF-8，链接里的空格 / # / % 等会做百分号编码）。图片目录里维护
+.md_pull_images-manifest.json 记录 URL 与文件名的对应，避免误用同名旧文件。
+
+安全与限流默认值：单张上限 25 MiB，私网/回环/元数据地址默认拒绝（需
+--allow-private-addresses），远程图片总数超过 --throttle-threshold（默认 20）
+时按桶限制并发与请求间隔。退出码：0 全成功，1 有失败，2 参数或路径问题。
 
 用法示例：
     python md_pull_images.py 排序算法.md
     python md_pull_images.py 排序算法.md --rewrite
     python md_pull_images.py ./notes --rewrite --assets-dir assets
     python md_pull_images.py ./notes --rewrite --throttle-scope site --per-host-interval 0.6
-
-批量拉取时，图片总数超过 --throttle-threshold（默认 20）会自动按同源限流：
-每个源限制并发数并强制请求间隔，避免被图床按 IP 限速。
 """
 
 from __future__ import annotations
@@ -1119,15 +1124,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--referer", default=None,
                         help="自定义 Referer；默认使用图片域名首页，用于绕过防盗链")
     parser.add_argument("--throttle-threshold", type=int, default=20,
-                        help="远程图片总数超过该值时启用同源限流，默认 20；0 表示始终启用")
+                        help="远程图片总数超过该值时启用限流（默认按同源分桶），默认 20；0 表示始终启用")
     parser.add_argument("--throttle-scope", choices=("origin", "site"), default="origin",
                         help="限流分桶粒度：origin=规范化同源（默认），site=按可注册域名归并子域")
     parser.add_argument("--per-host-jobs", type=int, default=3,
-                        help="同源并发上限，默认 3")
+                        help="同桶并发上限，默认 3")
     parser.add_argument("--per-host-interval", type=float, default=0.4,
-                        help="同源相邻请求最小间隔秒，默认 0.4")
+                        help="同桶相邻请求最小间隔秒，默认 0.4")
     parser.add_argument("--no-throttle", action="store_true",
-                        help="关闭同源限流（小批量或自建图床时用）")
+                        help="关闭限流（小批量或自建图床时用）")
     parser.add_argument("--dry-run", action="store_true", help="只列出待下载的图片，不落盘")
     parser.add_argument("-q", "--quiet", action="store_true", help="只输出汇总")
     parser.set_defaults(recursive=True)
@@ -1184,8 +1189,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  - {url}")
         print(f"\n共 {len(files)} 个文件 / {len(all_urls)} 张唯一远程图片（dry-run，未下载）")
         if throttle_needed:
-            print(f"预计启用同源限流：每源并发 ≤ {args.per_host_jobs}，"
-                  f"相邻间隔 ≥ {args.per_host_interval}s")
+            scope_text = "同源" if args.throttle_scope == "origin" else "同站"
+            print(f"预计启用{scope_text}限流：每桶并发 ≤ {args.per_host_jobs}，"
+                  f"同桶间隔 ≥ {args.per_host_interval}s")
         return 0
 
     throttle = None

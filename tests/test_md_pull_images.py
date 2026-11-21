@@ -736,5 +736,80 @@ class ThrottleTest(unittest.TestCase):
                                         f"span={arrivals[-1] - arrivals[0]:.2f}s")
 
 
+README = SCRIPT.parent / "README.md"
+
+
+class DocsConsistencyTest(unittest.TestCase):
+    """README 参数表必须与 CLI 同步：改了参数却忘了改文档，会在这里报错。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parser = pull_images.build_parser()
+        cls.actions = {action.dest: action for action in cls.parser._actions}
+        cls.readme = README.read_text(encoding="utf-8")
+
+    def test_every_long_option_is_documented_and_no_ghost_option(self):
+        options = {
+            option
+            for action in self.parser._actions  # 按 action 取，dest 会重复
+            for option in action.option_strings
+            if option.startswith("--")
+        }
+        options.discard("--help")  # argparse 内置，不单独占文档行
+        # README 表格里短选项写在前面（`-o, --assets-dir`），所以整篇扫长选项即可
+        documented = set(re.findall(r"--[a-z][a-z0-9-]*", self.readme))
+        self.assertEqual(sorted(options - documented), [], "README 缺少这些参数")
+        self.assertEqual(sorted(documented - options), [], "README 写了不存在的参数")
+
+    def test_documented_defaults_match_parser(self):
+        cases = {
+            "jobs": (8, "默认 8"),
+            "timeout": (20.0, "默认 20"),
+            "retries": (2, "默认 2"),
+            "throttle_threshold": (20, "默认 `20`"),
+            "per_host_jobs": (3, "默认 `3`"),
+            "per_host_interval": (0.4, "默认 `0.4`"),
+            "max_image_size": (25 * 1024 * 1024, "默认 25 MiB"),
+        }
+        rows = [
+            line for line in self.readme.splitlines()
+            if line.startswith("| `") and "--" in line
+        ]
+        for dest, (value, phrase) in cases.items():
+            action = self.actions[dest]
+            self.assertEqual(action.default, value, f"{dest} 的默认值变了")
+            flag = action.option_strings[-1]
+            row = next((line for line in rows if flag in line), None)
+            self.assertIsNotNone(row, f"README 参数表里没有 {flag}")
+            self.assertIn(phrase, row, f"{flag} 的默认值说明没跟上实现")
+
+    def test_rewrite_normalizes_encoding_to_utf8(self):
+        # 读侧 utf-8-sig / utf-8 / gb18030，写侧固定 UTF-8；README 已声明该行为
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            gb = Path(work) / "gb.md"
+            gb.write_bytes(f"中文标题\n\n![图]({base}/pic/a.png)\n".encode("gb18030"))
+            proc = self._run(gb)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            raw = gb.read_bytes()
+            text = raw.decode("utf-8")  # GB18030 原文件应已被转成 UTF-8
+            self.assertIn("中文标题", text)
+            self.assertIn("gb.assets/a.png", text)
+            self.assertNotIn(base, text)
+
+            bom = Path(work) / "bom.md"
+            bom.write_bytes(b"\xef\xbb\xbf" + f"![图]({base}/pic/b.png)\n".encode("utf-8"))
+            proc = self._run(bom)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            raw = bom.read_bytes()
+            self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), "回写应去掉 BOM")
+            self.assertIn("bom.assets/b.png", raw.decode("utf-8"))
+
+    def _run(self, md: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--allow-private-addresses", str(md), "--rewrite"],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

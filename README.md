@@ -25,7 +25,7 @@
 - `<img src="https://.../b.gif" width="120" />`
 - 引用式：`![alt][ref]` + `[ref]: https://.../c.jpg`（也支持 `![ref][]` 折写）
 
-解析时会忽略围栏代码块、缩进代码、行内代码和 HTML 注释中的示例；Markdown 图片 URL 支持平衡括号，HTML 图片只读取真正的 `src` 属性（不会把 `data-src` 当成 `src`）。只下载 `http(s)` 与 `//` 协议开头的图片；已经是本地相对路径、绝对路径、`data:` URI 的图片会原样跳过。
+解析时会忽略围栏代码块、缩进代码、行内代码、`<pre>`/`<code>` 块和 HTML 注释中的示例；Markdown 图片 URL 支持平衡括号，HTML 图片只读取真正的 `src` 属性（不会把 `data-src` 当成 `src`）。只下载 `http(s)` 与 `//` 协议开头的图片；已经是本地相对路径、绝对路径、`data:` URI 的图片会原样跳过。
 
 ### 用法
 
@@ -50,7 +50,7 @@ python md_pull_images.py ./笔记库 --dry-run
 | 参数 | 说明 |
 | --- | --- |
 | `target` | Markdown 文件或目录 |
-| `-o, --assets-dir` | 图片目录。单文件时即目标目录；目录模式时为 `<assets-dir>/<md 文件名>/` |
+| `-o, --assets-dir` | 图片目录。单文件时为该目录；目录模式时为 `<assets-dir>/<md 文件名（不含扩展名）>/` |
 | `--rewrite` | 把 md 里的远程链接替换成本地相对路径（默认只下载不改文件） |
 | `--backup` | 回写前生成 `.md.bak` |
 | `--overwrite` | 重新下载并覆盖同一 URL 在 manifest 中登记的文件；不同 URL 不会互相覆盖。对没有来源记录的旧同名文件，显式指定时仍允许覆盖 |
@@ -155,11 +155,12 @@ python md_pull_images.py 排序算法.md --rewrite \
 - 限流计数在单进程内生效，同时开多个进程跑同一批站点，各自的节奏是独立的；
 - `site` 使用内置常见公共后缀子集，不等同于完整 PSL；特殊国家/地区后缀可能需要自行补充代码中的 `_MULTI_LABEL_PUBLIC_SUFFIXES`；
 - 默认私网地址拦截会影响本机/内网图床，确认来源可信后使用 `--allow-private-addresses`；DNS 预检与实际连接之间仍存在标准库 URL 客户端难以完全消除的 DNS 重绑定时间窗口，不应把它当作隔离不可信输入的唯一安全边界；
-- 内容校验基于图片文件签名与 MIME 检查，不执行完整的图像解码；当前识别 PNG/JPEG/GIF/WebP/BMP/TIFF/ICO/AVIF/SVG，HEIC、JXL 等格式会被判为不支持而失败；
+- 内容校验基于图片文件签名与 MIME 检查，不执行完整的图像解码；当前识别 PNG/APNG/JPEG/GIF/WebP/BMP/TIFF/ICO/AVIF/SVG，HEIC、JXL 等格式会被判为不支持而失败；
 - 为避免把代码示例当图片改写，围栏代码、缩进代码、行内代码、`<pre>`/`<code>` 和 HTML 注释会被整体屏蔽；代价是列表项内以 4 空格缩进到「缩进代码」位置的图片也会被跳过，这类笔记请减少缩进或改用围栏外的普通段落；
 - 图片文件名含空格、`#`、`%` 时，回写会做百分号编码（`![a](assets/a%20b.png)`），否则 Markdown 会把空格当标题分隔、把 `#` 当片段；括号成对时保持原样，不成对才编码；
 - `<assets-dir>` 与 Markdown 不在同一盘符（Windows）时无法生成相对链接：图片仍会落盘，该文件的回写会被跳过并计为失败，程序继续处理其余文件；
 - 单个文件出错（只读、无写权限、路径异常）只记录失败，不会中断整批任务；
+- 读取时按 UTF-8（含 BOM）、GB18030 顺序尝试解码，`--rewrite` 统一按 UTF-8 写回：GB18030 的旧笔记会被转码成 UTF-8，带 BOM 的文件会去掉 BOM；若需要保持原编码，请先自行转码再运行；
 - 体积超限、Content-Type 非图片、格式与 MIME 不符这类失败不会重试；HTTP 4xx（408/429 除外）也不会重试，429/5xx/超时仍按 `--retries` 重试；
 - 重试请求同样占用限流位并计入统计，所以「次请求」可能大于图片张数。
 
@@ -172,19 +173,20 @@ kb-tools/
 ├── md_pull_images.py          # 拉取 md 远程图片
 ├── tests/
 │   └── test_md_pull_images.py # 本地 HTTP 服务做的离线测试
+├── .gitignore
 ├── LICENSE
 └── README.md
 ```
 
 ## 测试
 
-不联网：测试自己起本地 HTTP 服务当图床，并用一个会计数的 handler 记录并发峰值和请求时刻，用来验证限流真的生效（同源并发不超上限、间隔被拉开、跨源仍并行、`site` 能合并子域）。
+不联网：测试自己起本地 HTTP 服务当图床，并用一个记录请求数、并发峰值和请求时刻的 handler，用来验证限流真的生效（同桶并发不超上限、间隔被拉开、跨源仍并行、`site` 能合并子域）。
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖下载与回写、引用式重复引用、代码块与 HTML 属性解析、同名文件冲突与 manifest 幂等、数值参数边界、图片体积/内容校验、私网与重定向拦截、`Retry-After` 日期解析、URL/站点分桶规范化，以及同源限流和跨源并行。离线测试的本地 HTTP 服务显式使用 `--allow-private-addresses`。
+测试覆盖下载与回写、引用式重复引用、代码块与 HTML 属性解析、同名文件冲突与 manifest 幂等、数值参数边界、图片体积/内容校验、私网与重定向拦截、`Retry-After` 日期解析、URL/站点分桶规范化，以及同源限流和跨源并行；另有一组用例校验 README 参数表与 CLI 参数、默认值保持同步，改参数时文档会跟着报错。离线测试的本地 HTTP 服务显式使用 `--allow-private-addresses`。
 
 ## 贡献
 
