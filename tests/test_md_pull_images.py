@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import base64
 import http.server
+import io
 import os
 import re
 import socket
@@ -18,7 +19,7 @@ import unittest
 from unittest import mock
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "md_pull_images.py"
@@ -365,23 +366,30 @@ class RewriteAndCollisionTest(unittest.TestCase):
             self.assertTrue((assets / "a.png").is_file())
             self.assertFalse(report.rewritten)
 
-    def test_read_only_markdown_fails_soft_and_batch_continues(self):
+    def test_single_file_rewrite_failure_does_not_abort_batch(self):
+        # 用 mock 模拟回写失败：POSIX 允许在可写目录里 rename 覆盖只读文件，
+        # 靠 chmod 造失败在 Linux 上不成立，跨平台也不稳定。
         with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
             locked = Path(work) / "locked.md"
             locked.write_text(f"![a]({base}/pic/a.png)", encoding="utf-8")
             ok = Path(work) / "ok.md"
             ok.write_text(f"![a]({base}/pic/a.png)", encoding="utf-8")
-            os.chmod(locked, 0o444)
-            if os.access(locked, os.W_OK):
-                os.chmod(locked, 0o666)
-                self.skipTest("当前平台未强制只读权限")
-            try:
-                proc = self._run(str(Path(work)), "--rewrite")
-            finally:
-                os.chmod(locked, 0o666)
-            self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
-            self.assertNotIn("Traceback", proc.stderr, proc.stderr)
-            self.assertIn("回写失败", proc.stdout)
+            real_write = pull_images._atomic_write_text
+
+            def flaky(path, content, encoding="utf-8"):
+                if Path(path).name == "locked.md":
+                    raise OSError(13, "Permission denied")
+                return real_write(path, content, encoding)
+
+            buffer = io.StringIO()
+            with mock.patch("md_pull_images._atomic_write_text", side_effect=flaky), \
+                    redirect_stdout(buffer):
+                code = pull_images.main(
+                    [str(Path(work)), "--rewrite", "--allow-private-addresses"]
+                )
+            output = buffer.getvalue()
+            self.assertEqual(code, 1, output)
+            self.assertIn("回写失败", output)
             # 前一个文件失败不应影响后续文件
             self.assertIn("ok.assets/a.png", ok.read_text(encoding="utf-8"))
 
@@ -783,6 +791,20 @@ class StreamingAndSyntaxTest(unittest.TestCase):
             assets = Path(work) / "mix.assets"
             self.assertEqual(list(assets.glob(".mdpull-*")), [], "失败项不应留下临时文件")
             self.assertTrue((assets / "a.png").is_file())
+
+    def test_chinese_output_survives_legacy_console_encoding(self):
+        # 英文 Windows 控制台默认 cp1252，打印中文路径/提示不能崩
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            md = Path(work) / "中文笔记.md"
+            md.write_text(f"![图]({base}/pic/a.png)\n", encoding="utf-8")
+            env = dict(os.environ, PYTHONIOENCODING="cp1252")
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT), "--allow-private-addresses", str(md), "--rewrite"],
+                capture_output=True, text=True, encoding="utf-8", env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertNotIn("UnicodeEncodeError", proc.stderr)
+            self.assertIn("中文笔记.assets/a.png", md.read_text(encoding="utf-8"))
 
     def test_fetch_spools_to_disk_and_reports_path(self):
         with tempfile.TemporaryDirectory() as work, _single_image_server() as base:

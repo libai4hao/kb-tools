@@ -165,6 +165,7 @@ python md_pull_images.py 排序算法.md --rewrite \
 - 单个文件出错（只读、无写权限、路径异常）只记录失败，不会中断整批任务；
 - 每张图下载完立即写入资产目录的临时文件（`.mdpull-*.part`），命名确定后再原子改名成最终文件；内存峰值只与 `--jobs × --max-image-size` 有关（默认 8 × 25 MiB 封顶），不再随图片总量线性增长。进程被强杀时可能残留 `.mdpull-*.part`，确认没有任务在跑后可直接删除，正常运行（含失败、跳过）都会清理；
 - 读取时按 UTF-8（含 BOM）、GB18030 顺序尝试解码，`--rewrite` 统一按 UTF-8 写回：GB18030 的旧笔记会被转码成 UTF-8，带 BOM 的文件会去掉 BOM；若需要保持原编码，请先自行转码再运行；
+- 输出编码：写到管道/重定向时统一用 UTF-8，交互终端保留系统编码、只把无法编码的字符替换掉，避免英文 Windows（cp1252）打印中文路径或提示时抛 `UnicodeEncodeError` 中断任务；
 - 体积超限、Content-Type 非图片、格式与 MIME 不符这类失败不会重试；HTTP 4xx（408/429 除外）也不会重试，429/5xx/超时仍按 `--retries` 重试；
 - 重试请求同样占用限流位并计入统计，所以「次请求」可能大于图片张数。
 
@@ -193,7 +194,7 @@ python -m unittest discover -s tests -v
 
 测试覆盖下载与回写、引用式重复引用、代码块与 HTML 属性解析、同名文件冲突与 manifest 幂等、数值参数边界、图片体积/内容校验、私网与重定向拦截、`Retry-After` 日期解析、URL/站点分桶规范化，以及同源限流和跨源并行；另有一组用例校验 README 参数表与 CLI 参数、默认值保持同步，改参数时文档会跟着报错。离线测试的本地 HTTP 服务显式使用 `--allow-private-addresses`。
 
-CI（`.github/workflows/ci.yml`）在 Ubuntu 与 Windows 上跑 Python 3.8、3.11、3.13 三档矩阵，覆盖 README 声明的 3.8+ 最低版本；本地只装了 3.13/3.11 也能靠单测里的 `ast.parse(feature_version=(3, 8))` 兜住语法层面的回退。
+CI（`.github/workflows/ci.yml`）在 Ubuntu（3.8 固定跑 ubuntu-22.04，新版 runner 已不再提供 3.8）与 Windows 上跑 Python 3.8、3.11、3.13 三档矩阵，覆盖 README 声明的 3.8+ 最低版本；本地只装了 3.13/3.11 也能靠单测里的 `ast.parse(feature_version=(3, 8))` 兜住语法层面的回退。
 
 ## 贡献
 

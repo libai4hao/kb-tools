@@ -1193,7 +1193,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _relax_output_encoding() -> None:
+    """管道/重定向输出统一用 UTF-8，终端则保留原编码、只把无法编码的字符替换掉。
+
+    英文 Windows 的默认代码页是 cp1252，直接 print 中文路径或限流提示会抛
+    UnicodeEncodeError 并把整批任务打断，这里提前兜住。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is None:
+                continue
+            if not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            else:
+                stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _relax_output_encoding()
     parser = build_parser()
     args = parser.parse_args(argv)
 
