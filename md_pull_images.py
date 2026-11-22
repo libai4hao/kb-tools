@@ -20,6 +20,7 @@ manifest 里还记录每个 URL 最近命中的时间：--rewrite-only 只按登
 --prune-manifest DAYS 清理文件已缺失或长期未命中的记录（只删记录不删图片）。
 二次运行时已登记且文件仍在的图片直接复用、不再发请求；--overwrite 才会强制重拉。
 回写前会比对读取时的 mtime/size，运行期间被外部改过的文件跳过不写。
+site 分桶默认用内置公共后缀子集，可用 --public-suffix-file 在运行期追加。
 
 安全与限流默认值：单张上限 25 MiB，私网/回环/元数据地址默认拒绝（需
 --allow-private-addresses），远程图片总数超过 --throttle-threshold（默认 20）
@@ -51,11 +52,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 MD_SUFFIXES = {".md", ".markdown", ".mdown", ".mkd"}
@@ -434,7 +435,26 @@ _MULTI_LABEL_PUBLIC_SUFFIXES = {
 }
 
 
-def _registrable_domain(host: str) -> str:
+def _load_public_suffixes(path: Path) -> set[str]:
+    """读取每行一个后缀的文本文件（`//` 之后为注释），用于扩展 site 分桶。"""
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        raise ValueError(f"无法读取公共后缀文件 {path}: {exc}") from exc
+    suffixes: set[str] = set()
+    for raw in lines:
+        line = raw.split("//", 1)[0].strip().lower().lstrip(".")
+        if not line:
+            continue
+        if not re.fullmatch(r"[a-z0-9.-]+", line):
+            raise ValueError(f"公共后缀文件里有非法条目: {raw.strip()}")
+        suffixes.add(line)
+    if not suffixes:
+        raise ValueError(f"公共后缀文件 {path} 没有任何可用后缀")
+    return suffixes
+
+
+def _registrable_domain(host: str, suffixes: set[str] | None = None) -> str:
     normalized = _normalized_host(host)
     try:
         return ipaddress.ip_address(normalized).compressed
@@ -443,17 +463,21 @@ def _registrable_domain(host: str) -> str:
     labels = [label for label in normalized.split(".") if label]
     if len(labels) <= 1:
         return normalized
-    suffix2 = ".".join(labels[-2:])
-    if suffix2 in _MULTI_LABEL_PUBLIC_SUFFIXES and len(labels) >= 3:
-        return ".".join(labels[-3:])
-    return suffix2
+    table = _MULTI_LABEL_PUBLIC_SUFFIXES if suffixes is None else (
+        _MULTI_LABEL_PUBLIC_SUFFIXES | suffixes
+    )
+    for take in range(min(len(labels) - 1, 3), 1, -1):
+        if ".".join(labels[-take:]) in table:
+            return ".".join(labels[-(take + 1):])
+    return ".".join(labels[-2:])
 
 
-def throttle_key(url: str, scope: str = "origin") -> str:
+def throttle_key(url: str, scope: str = "origin",
+                 suffixes: set[str] | None = None) -> str:
     """Return a canonical origin or registrable-site bucket key."""
     parts = urllib.parse.urlsplit(url)
     if scope == "site":
-        return _registrable_domain(parts.hostname or "")
+        return _registrable_domain(parts.hostname or "", suffixes)
     return origin_of(url)
 
 
@@ -1182,6 +1206,7 @@ def process_file(
     args: argparse.Namespace,
     used_names: dict[str, str],
     throttle: "HostThrottle | None" = None,
+    public_suffixes: set[str] | None = None,
 ) -> FileReport:
     text = read_text(md_path)
     expected_stat = _file_signature(md_path)
@@ -1224,7 +1249,7 @@ def process_file(
     keys: dict[str, str] = {}
     for url in to_fetch:
         try:
-            keys[url] = throttle_key(url, args.throttle_scope)
+            keys[url] = throttle_key(url, args.throttle_scope, public_suffixes)
         except ValueError:
             # Keep malformed URLs isolated; fetch() will report the URL error.
             keys[url] = url
@@ -1358,6 +1383,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="远程图片总数超过该值时启用限流（默认按同源分桶），默认 20；0 表示始终启用")
     parser.add_argument("--throttle-scope", choices=("origin", "site"), default="origin",
                         help="限流分桶粒度：origin=规范化同源（默认），site=按可注册域名归并子域")
+    parser.add_argument("--public-suffix-file", type=Path, default=None, metavar="PATH",
+                        help="追加公共后缀表（每行一个后缀，`//` 之后为注释），"
+                             "用于 site 分桶识别内置表没有的后缀")
     parser.add_argument("--per-host-jobs", type=int, default=3,
                         help="同桶并发上限，默认 3")
     parser.add_argument("--per-host-interval", type=float, default=0.4,
@@ -1416,6 +1444,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--prune-manifest 必须大于等于 0")
     if args.rewrite_only:
         args.rewrite = True
+
+    public_suffixes: set[str] | None = None
+    if args.public_suffix_file:
+        try:
+            public_suffixes = _MULTI_LABEL_PUBLIC_SUFFIXES | _load_public_suffixes(
+                args.public_suffix_file
+            )
+        except ValueError as exc:
+            print(f"公共后缀文件无效: {exc}", file=sys.stderr)
+            return 2
 
     target: Path = args.target
     if not target.exists():
@@ -1477,7 +1515,8 @@ def main(argv: list[str] | None = None) -> int:
         if not args.quiet:
             print(f"\n>> {md}  (assets -> {assets_dir})")
         try:
-            reports.append(process_file(md, assets_dir, args, used_names, throttle))
+            reports.append(process_file(md, assets_dir, args, used_names, throttle,
+                                        public_suffixes))
         except Exception as exc:  # noqa: BLE001 - 单个文件出错不应中断整批
             failed = FileReport(md, assets_dir)
             failed.failed.append((str(md), f"处理失败: {type(exc).__name__}: {exc}"))

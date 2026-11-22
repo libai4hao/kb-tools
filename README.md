@@ -71,6 +71,7 @@ python md_pull_images.py ./笔记库 --rewrite --prune-manifest 90
 | `--referer` | 自定义 Referer；不填则用图片域名首页，用于绕过常见防盗链 |
 | `--throttle-threshold` | 远程图片总数超过该值时启用限流，默认 `20`；`0` 表示始终启用 |
 | `--throttle-scope` | 限流分桶粒度：`origin`（默认，规范化协议/主机/端口）/ `site`（按可注册域名合并同站子域） |
+| `--public-suffix-file PATH` | 追加公共后缀表（每行一个后缀，`//` 之后为注释），让 `site` 分桶认识内置表没有的特殊后缀；内置表仍生效 |
 | `--per-host-jobs` | 同桶并发上限，默认 `3` |
 | `--per-host-interval` | 同桶相邻请求最小间隔秒，默认 `0.4` |
 | `--no-throttle` | 关闭限流（小批量、自建图床时用） |
@@ -163,7 +164,7 @@ python md_pull_images.py 排序算法.md --rewrite \
 - 写作时请勿并发改同一个 md，`--rewrite` 是整文件重写；
 - 少数站点会校验 Referer + Cookie 双重防盗链，这种只能 `--referer` 加上自行处理 Cookie；
 - 限流计数在单进程内生效，同时开多个进程跑同一批站点，各自的节奏是独立的；
-- `site` 使用内置常见公共后缀子集，不等同于完整 PSL；特殊国家/地区后缀可能需要自行补充代码中的 `_MULTI_LABEL_PUBLIC_SUFFIXES`；
+- `site` 使用内置常见公共后缀子集，不等同于完整 PSL；特殊国家/地区后缀可以补进代码里的 `_MULTI_LABEL_PUBLIC_SUFFIXES`，或用 `--public-suffix-file` 在运行期追加（内置表仍生效，避免 `co.uk` 这类常见后缀失效）；
 - 默认私网地址拦截会影响本机/内网图床，确认来源可信后使用 `--allow-private-addresses`；DNS 预检与实际连接之间仍存在标准库 URL 客户端难以完全消除的 DNS 重绑定时间窗口，不应把它当作隔离不可信输入的唯一安全边界；
 - 内容校验基于图片文件签名与 MIME 检查，不执行完整的图像解码；当前识别 PNG/APNG/JPEG/GIF/WebP/BMP/TIFF/ICO/AVIF/SVG，HEIC、JXL 等格式会被判为不支持而失败；
 - 为避免把代码示例当图片改写，围栏代码、缩进代码、行内代码、`<pre>`/`<code>` 和 HTML 注释会被整体屏蔽；代价是列表项内以 4 空格缩进到「缩进代码」位置的图片也会被跳过，这类笔记请减少缩进或改用围栏外的普通段落；
@@ -205,7 +206,13 @@ kb-tools/
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖下载与回写、引用式重复引用、代码块与 HTML 属性解析、同名文件冲突与 manifest 幂等、manifest 命中时间与清理规则、`--rewrite-only` 不联网回写、二次运行复用本地图片与缺图补下、回写前的并发修改检测、数值参数边界、图片体积/内容校验、私网与重定向拦截、`Retry-After` 日期解析、URL/站点分桶规范化，以及同源限流和跨源并行；另有一组用例校验 README 参数表与 CLI 参数、默认值保持同步，改参数时文档会跟着报错。离线测试的本地 HTTP 服务显式使用 `--allow-private-addresses`。
+可选地做一次静态检查（配置在 `pyproject.toml`，仅 `ruff check`，不格式化、不参与 CI）：
+
+```bash
+ruff check md_pull_images.py tests/test_md_pull_images.py
+```
+
+测试覆盖下载与回写、引用式重复引用、代码块与 HTML 属性解析、同名文件冲突与 manifest 幂等、manifest 命中时间与清理规则、`--rewrite-only` 不联网回写、二次运行复用本地图片与缺图补下、回写前的并发修改检测、公共后缀文件追加与非法条目拦截、数值参数边界、图片体积/内容校验、私网与重定向拦截、`Retry-After` 日期解析、URL/站点分桶规范化，以及同源限流和跨源并行；另有一组用例校验 README 参数表与 CLI 参数、默认值保持同步，改参数时文档会跟着报错。离线测试的本地 HTTP 服务显式使用 `--allow-private-addresses`。
 
 CI（`.github/workflows/ci.yml`）在 Ubuntu（3.8 固定跑 ubuntu-22.04，新版 runner 已不再提供 3.8）与 Windows 上跑 Python 3.8、3.11、3.13 三档矩阵，覆盖 README 声明的 3.8+ 最低版本；本地只装了 3.13/3.11 也能靠单测里的 `ast.parse(feature_version=(3, 8))` 兜住语法层面的回退。
 

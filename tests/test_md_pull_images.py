@@ -17,11 +17,11 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest import mock
+from contextlib import contextmanager, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
-from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent.parent / "md_pull_images.py"
 sys.path.insert(0, str(SCRIPT.parent))
@@ -939,6 +939,66 @@ class IncrementalRunTest(unittest.TestCase):
             self.assertEqual(code, 1, output)
             self.assertIn("文件在运行期间被修改", output)
             self.assertEqual(md.read_text(encoding="utf-8"), original)
+
+
+class SiteSuffixTest(unittest.TestCase):
+    """site 分桶的后缀表：内置表 + --public-suffix-file 追加。"""
+
+    def test_custom_suffix_merges_subdomains(self):
+        self.assertEqual(
+            pull_images._registrable_domain("img.a.example.co.zz", {"co.zz"}),
+            "example.co.zz",
+        )
+        # 内置表在自定义表存在时仍生效
+        self.assertEqual(
+            pull_images.throttle_key("https://img.example.co.uk/x.png", "site"),
+            "example.co.uk",
+        )
+        self.assertEqual(
+            pull_images.throttle_key("https://img.example.co.uk/x.png", "site", {"co.zz"}),
+            "example.co.uk",
+        )
+
+    def test_public_suffix_file_is_accepted_on_cli(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            rules = Path(work) / "psl.txt"
+            rules.write_text("// 自定义后缀\nco.zz\n\n", encoding="utf-8")
+            md = Path(work) / "suffix.md"
+            md.write_text(f"![a]({base}/pic/a.png)\n", encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT), "--allow-private-addresses", str(md),
+                 "--throttle-scope", "site", "--throttle-threshold", "0",
+                 "--public-suffix-file", str(rules), "--rewrite"],
+                capture_output=True, text=True, encoding="utf-8",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("启用同站限流", proc.stdout)
+
+    def test_invalid_public_suffix_file_is_rejected(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            rules = Path(work) / "bad.txt"
+            rules.write_text("co.zz\nnot a suffix!\n", encoding="utf-8")
+            md = Path(work) / "bad.md"
+            md.write_text(f"![a]({base}/pic/a.png)\n", encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT), "--allow-private-addresses", str(md),
+                 "--public-suffix-file", str(rules)],
+                capture_output=True, text=True, encoding="utf-8",
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("公共后缀文件无效", proc.stderr)
+
+    def test_missing_public_suffix_file_is_rejected(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            md = Path(work) / "none.md"
+            md.write_text(f"![a]({base}/pic/a.png)\n", encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT), "--allow-private-addresses", str(md),
+                 "--public-suffix-file", str(Path(work) / "absent.txt")],
+                capture_output=True, text=True, encoding="utf-8",
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("无法读取公共后缀文件", proc.stderr)
 
 
 class StreamingAndSyntaxTest(unittest.TestCase):

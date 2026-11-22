@@ -1,0 +1,9 @@
+# 仅供本地静态检查使用（ruff check），刻意不写 [project]/[build-system]，
+# 避免被 pip/构建工具当成可安装包解析。CI 不接入 ruff，保持零外部依赖。
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "I"]
+ignore = ["E501"]
