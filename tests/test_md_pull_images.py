@@ -6,6 +6,7 @@ import ast
 import base64
 import http.server
 import io
+import json
 import os
 import re
 import socket
@@ -742,6 +743,115 @@ class ThrottleTest(unittest.TestCase):
                                  f"peak={_TrackingHandler.peak}")
                 self.assertGreaterEqual(arrivals[-1] - arrivals[0], 0.7,
                                         f"span={arrivals[-1] - arrivals[0]:.2f}s")
+
+
+MANIFEST_NAME = ".md_pull_images-manifest.json"
+
+
+def _seed_manifest(assets_dir: Path, files: dict[str, str], seen: dict[str, str]) -> None:
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 2, "files": files, "seen": seen}
+    (assets_dir / MANIFEST_NAME).write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+class ManifestMaintenanceTest(unittest.TestCase):
+    """manifest 记录命中时间、按规则清理，以及不联网的 --rewrite-only。"""
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--allow-private-addresses", *args],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+
+    def test_manifest_records_last_seen_and_version(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            md = Path(work) / "seen.md"
+            md.write_text(f"![a]({base}/pic/a.png)\n", encoding="utf-8")
+            proc = self._run(str(md), "--rewrite")
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            payload = json.loads(
+                (Path(work) / "seen.assets" / MANIFEST_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["version"], 2)
+            url = f"{base}/pic/a.png"
+            self.assertEqual(payload["files"], {url: "a.png"})
+            stamp = datetime.fromisoformat(payload["seen"][url])
+            self.assertIsNotNone(stamp.tzinfo)
+            self.assertLess(abs((datetime.now(timezone.utc) - stamp).total_seconds()), 600)
+
+    def test_prune_manifest_drops_missing_and_stale_records(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            md = Path(work) / "prune.md"
+            md.write_text(f"![x]({base}/pic/missing.png)\n", encoding="utf-8")
+            assets = Path(work) / "prune.assets"
+            assets.mkdir()
+            (assets / "fresh.png").write_bytes(PNG_1PX)
+            (assets / "stale.png").write_bytes(PNG_1PX)
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            stale = (now - timedelta(days=40)).isoformat()
+            _seed_manifest(
+                assets,
+                {
+                    "https://a.example.com/fresh.png": "fresh.png",
+                    "https://a.example.com/stale.png": "stale.png",
+                    "https://a.example.com/gone.png": "gone.png",
+                },
+                {
+                    "https://a.example.com/fresh.png": now.isoformat(),
+                    "https://a.example.com/stale.png": stale,
+                },
+            )
+            proc = self._run(str(md), "--prune-manifest", "30")
+            self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)  # 图 404
+            self.assertIn("清理 2 条记录（文件已缺失 1）", proc.stdout)
+            payload = json.loads((assets / MANIFEST_NAME).read_text(encoding="utf-8"))
+            self.assertEqual(sorted(payload["files"]), ["https://a.example.com/fresh.png"])
+            self.assertEqual(sorted(payload["seen"]), ["https://a.example.com/fresh.png"])
+
+    def test_prune_manifest_zero_only_drops_missing_files(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            md = Path(work) / "keep.md"
+            md.write_text(f"![a]({base}/pic/a.png)\n", encoding="utf-8")
+            assets = Path(work) / "keep.assets"
+            assets.mkdir()
+            (assets / "old.png").write_bytes(PNG_1PX)
+            long_ago = (datetime.now(timezone.utc) - timedelta(days=400)).replace(
+                microsecond=0).isoformat()
+            _seed_manifest(assets, {"https://a.example.com/old.png": "old.png"},
+                           {"https://a.example.com/old.png": long_ago})
+            proc = self._run(str(md), "--prune-manifest", "0")
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            payload = json.loads((assets / MANIFEST_NAME).read_text(encoding="utf-8"))
+            self.assertIn("https://a.example.com/old.png", payload["files"])
+
+    def test_rewrite_only_rewrites_from_manifest_without_network(self):
+        with tempfile.TemporaryDirectory() as work, _second_server() as base:
+            md = Path(work) / "offline.md"
+            remote = f"![a]({base}/pic/0.png)\n"
+            md.write_text(remote, encoding="utf-8")
+            first = self._run(str(md), "--rewrite")
+            self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+            rewritten = md.read_text(encoding="utf-8")
+            self.assertIn("offline.assets/0.png", rewritten)
+
+            md.write_text(remote, encoding="utf-8")  # 模拟回写没落到文件
+            _TrackingHandler.reset()
+            second = self._run(str(md), "--rewrite-only")
+            self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+            self.assertEqual(_TrackingHandler.starts, [], "不应发起任何网络请求")
+            self.assertEqual(md.read_text(encoding="utf-8"), rewritten)
+
+    def test_rewrite_only_reports_unregistered_url(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            md = Path(work) / "unknown.md"
+            original = f"![a]({base}/pic/a.png)\n"
+            md.write_text(original, encoding="utf-8")
+            proc = self._run(str(md), "--rewrite-only")
+            self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
+            self.assertIn("manifest 未登记该 URL 或本地文件缺失", proc.stdout)
+            self.assertEqual(md.read_text(encoding="utf-8"), original)
 
 
 class StreamingAndSyntaxTest(unittest.TestCase):

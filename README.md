@@ -43,9 +43,15 @@ python md_pull_images.py ./笔记库 --rewrite
 
 # 4) 只看要下什么，不落盘
 python md_pull_images.py ./笔记库 --dry-run
+
+# 5) 图已下好、只差回写（跨盘或只读环境补救），读 manifest 不联网
+python md_pull_images.py ./笔记库 --rewrite-only --backup
+
+# 6) 顺手清理 manifest 里的陈旧记录（只删记录，不删图片）
+python md_pull_images.py ./笔记库 --rewrite --prune-manifest 90
 ```
 
-默认图片目录是 Markdown 同级的 `<文件名>.assets/`，回写后的链接形如 `排序算法.assets/xxx.png`，所以把 md 和 assets 目录一起搬走即可。图片目录中会额外维护隐藏文件 `.md_pull_images-manifest.json`，记录远程 URL 与本地文件名的对应关系；只有 manifest 确认属于同一 URL 的文件才会被复用，避免把旧的同名图片误认为新图片。建议把该 manifest 与图片一起保留。
+默认图片目录是 Markdown 同级的 `<文件名>.assets/`，回写后的链接形如 `排序算法.assets/xxx.png`，所以把 md 和 assets 目录一起搬走即可。图片目录中会额外维护隐藏文件 `.md_pull_images-manifest.json`，记录远程 URL 与本地文件名的对应关系，以及每个 URL 最近一次命中的时间；只有 manifest 确认属于同一 URL 的文件才会被复用，避免把旧的同名图片误认为新图片。建议把该 manifest 与图片一起保留。签名图床会让同一张图每次的 URL 都不同，条目会持续增长，可用 `--prune-manifest DAYS` 清掉文件已缺失或长期没再命中的记录（`0` 只清文件缺失项）。
 
 ### 参数
 
@@ -69,6 +75,8 @@ python md_pull_images.py ./笔记库 --dry-run
 | `--per-host-interval` | 同桶相邻请求最小间隔秒，默认 `0.4` |
 | `--no-throttle` | 关闭限流（小批量、自建图床时用） |
 | `--dry-run` | 只列出待下载图片，并提示是否将启用限流 |
+| `--rewrite-only` | 只按 manifest 里已有的登记回写本地链接，不联网；用于跨盘、只读等回写失败后的补救 |
+| `--prune-manifest DAYS` | 顺带清理 manifest：移除文件已缺失、或超过 `DAYS` 天没被命中的记录；`0` 表示只清理文件已缺失的记录。只删记录，不删图片文件 |
 | `-q, --quiet` | 只输出汇总 |
 
 退出码：全部成功 `0`，有失败 `1`，参数或路径问题 `2`。
@@ -166,6 +174,9 @@ python md_pull_images.py 排序算法.md --rewrite \
 - 每张图下载完立即写入资产目录的临时文件（`.mdpull-*.part`），命名确定后再原子改名成最终文件；内存峰值只与 `--jobs × --max-image-size` 有关（默认 8 × 25 MiB 封顶），不再随图片总量线性增长。进程被强杀时可能残留 `.mdpull-*.part`，确认没有任务在跑后可直接删除，正常运行（含失败、跳过）都会清理；
 - 读取时按 UTF-8（含 BOM）、GB18030 顺序尝试解码，`--rewrite` 统一按 UTF-8 写回：GB18030 的旧笔记会被转码成 UTF-8，带 BOM 的文件会去掉 BOM；若需要保持原编码，请先自行转码再运行；
 - 输出编码：写到管道/重定向时统一用 UTF-8，交互终端保留系统编码、只把无法编码的字符替换掉，避免英文 Windows（cp1252）打印中文路径或提示时抛 `UnicodeEncodeError` 中断任务；
+- `--rewrite-only` 只认 manifest 里已登记且文件仍存在的 URL：命中的回写、其余计失败；它不会补下载，也不会重建缺失的图片；
+- `--prune-manifest` 只删 manifest 记录、不删图片文件；旧版 manifest 没有命中时间，只按「文件已缺失」清理，不会被 `DAYS` 规则误删；
+- 每次运行都会把命中（下载成功或确认已存在）的 URL 的最近时间写回 manifest，所以正常使用下 manifest 会随运行更新，`version` 为 `2`；旧版读取方只看 `files` 字段，仍可兼容；
 - 体积超限、Content-Type 非图片、格式与 MIME 不符这类失败不会重试；HTTP 4xx（408/429 除外）也不会重试，429/5xx/超时仍按 `--retries` 重试；
 - 重试请求同样占用限流位并计入统计，所以「次请求」可能大于图片张数。
 
@@ -192,7 +203,7 @@ kb-tools/
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖下载与回写、引用式重复引用、代码块与 HTML 属性解析、同名文件冲突与 manifest 幂等、数值参数边界、图片体积/内容校验、私网与重定向拦截、`Retry-After` 日期解析、URL/站点分桶规范化，以及同源限流和跨源并行；另有一组用例校验 README 参数表与 CLI 参数、默认值保持同步，改参数时文档会跟着报错。离线测试的本地 HTTP 服务显式使用 `--allow-private-addresses`。
+测试覆盖下载与回写、引用式重复引用、代码块与 HTML 属性解析、同名文件冲突与 manifest 幂等、manifest 命中时间与清理规则、`--rewrite-only` 不联网回写、数值参数边界、图片体积/内容校验、私网与重定向拦截、`Retry-After` 日期解析、URL/站点分桶规范化，以及同源限流和跨源并行；另有一组用例校验 README 参数表与 CLI 参数、默认值保持同步，改参数时文档会跟着报错。离线测试的本地 HTTP 服务显式使用 `--allow-private-addresses`。
 
 CI（`.github/workflows/ci.yml`）在 Ubuntu（3.8 固定跑 ubuntu-22.04，新版 runner 已不再提供 3.8）与 Windows 上跑 Python 3.8、3.11、3.13 三档矩阵，覆盖 README 声明的 3.8+ 最低版本；本地只装了 3.13/3.11 也能靠单测里的 `ast.parse(feature_version=(3, 8))` 兜住语法层面的回退。
 

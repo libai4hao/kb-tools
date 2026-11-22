@@ -16,6 +16,8 @@
 .md_pull_images-manifest.json 记录 URL 与文件名的对应，避免误用同名旧文件。
 每张图下载完就写入资产目录的 .mdpull-*.part 临时文件，命名确定后再原子改名，
 所以内存峰值只与 --jobs 和单图上限有关，不随批量总量增长。
+manifest 里还记录每个 URL 最近命中的时间：--rewrite-only 只按登记回写、不联网，
+--prune-manifest DAYS 清理文件已缺失或长期未命中的记录（只删记录不删图片）。
 
 安全与限流默认值：单张上限 25 MiB，私网/回环/元数据地址默认拒绝（需
 --allow-private-addresses），远程图片总数超过 --throttle-threshold（默认 20）
@@ -26,6 +28,7 @@
     python md_pull_images.py 排序算法.md --rewrite
     python md_pull_images.py ./notes --rewrite --assets-dir assets
     python md_pull_images.py ./notes --rewrite --throttle-scope site --per-host-interval 0.6
+    python md_pull_images.py ./notes --rewrite-only --backup
 """
 
 from __future__ import annotations
@@ -46,7 +49,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
@@ -605,29 +608,87 @@ def _manifest_path(assets_dir: Path) -> Path:
     return assets_dir / ".md_pull_images-manifest.json"
 
 
-def _load_manifest(assets_dir: Path) -> dict[str, str]:
+@dataclass
+class Manifest:
+    """URL -> 文件名，以及每个 URL 最近一次命中的时间（用于清理陈旧条目）。"""
+
+    files: dict[str, str] = field(default_factory=dict)
+    seen: dict[str, str] = field(default_factory=dict)
+
+    def touch(self, url: str) -> None:
+        self.seen[url] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _parse_manifest_time(value: str | None) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp
+
+
+def _load_manifest(assets_dir: Path) -> Manifest:
     path = _manifest_path(assets_dir)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
-        return {}
+        return Manifest()
     if not isinstance(payload, dict) or not isinstance(payload.get("files"), dict):
-        return {}
-    result: dict[str, str] = {}
+        return Manifest()
+    files: dict[str, str] = {}
     for url, name in payload["files"].items():
         if not isinstance(url, str) or not isinstance(name, str):
             continue
         # Manifest values are basenames only; never trust a path from disk.
         if (name and Path(name).name == name and name not in (".", "..")
                 and "/" not in name and "\\" not in name and "\x00" not in name):
-            result[url] = name
-    return result
+            files[url] = name
+    seen: dict[str, str] = {}
+    raw_seen = payload.get("seen")
+    if isinstance(raw_seen, dict):
+        for url, stamp in raw_seen.items():
+            if isinstance(url, str) and isinstance(stamp, str) and url in files:
+                seen[url] = stamp
+    return Manifest(files, seen)
 
 
-def _save_manifest(assets_dir: Path, files: dict[str, str]) -> None:
-    payload = {"version": 1, "files": dict(sorted(files.items()))}
+def _save_manifest(assets_dir: Path, manifest: Manifest) -> None:
+    payload = {
+        "version": 2,
+        "files": dict(sorted(manifest.files.items())),
+        "seen": dict(sorted((url, stamp) for url, stamp in manifest.seen.items()
+                            if url in manifest.files)),
+    }
     encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     _atomic_write_bytes(_manifest_path(assets_dir), encoded)
+
+
+def _prune_manifest(manifest: Manifest, assets_dir: Path, days: int) -> tuple[int, int]:
+    """移除文件已缺失的条目，以及超过 days 天没被命中的条目。
+
+    返回 (移除总数, 其中文件缺失数)。days 传 0 表示只清理文件已缺失的记录。
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    removed = missing = 0
+    for url in list(manifest.files):
+        if not (assets_dir / manifest.files[url]).is_file():
+            del manifest.files[url]
+            manifest.seen.pop(url, None)
+            removed += 1
+            missing += 1
+            continue
+        if days <= 0:
+            continue
+        stamp = _parse_manifest_time(manifest.seen.get(url))
+        if stamp is not None and stamp < cutoff:
+            del manifest.files[url]
+            manifest.seen.pop(url, None)
+            removed += 1
+    return removed, missing
 
 
 def _path_key(path: Path) -> str:
@@ -659,12 +720,12 @@ def _select_asset_target(
     assets_dir: Path,
     url: str,
     suggested_name: str,
-    manifest: dict[str, str],
+    recorded: dict[str, str],
     owners: dict[str, str],
     used_names: dict[str, str],
     overwrite: bool,
 ) -> tuple[Path, bool]:
-    recorded_name = manifest.get(url)
+    recorded_name = recorded.get(url)
     candidate_name = recorded_name or suggested_name
     target = assets_dir / candidate_name
     key = _path_key(target)
@@ -967,6 +1028,118 @@ def _relative_asset_dir(assets_dir: Path, md_parent: Path) -> Path | None:
         return None
 
 
+def _load_manifest_with_prune(
+    assets_dir: Path, args: argparse.Namespace
+) -> tuple[Manifest, Manifest]:
+    """读取 manifest，并按 `--prune-manifest` 清理陈旧条目，返回 (当前, 原始)。"""
+    original = _load_manifest(assets_dir)
+    manifest = Manifest(dict(original.files), dict(original.seen))
+    days = getattr(args, "prune_manifest", None)
+    if days is None:
+        return manifest, original
+    removed, missing = _prune_manifest(manifest, assets_dir, days)
+    if removed and not args.quiet:
+        print(f"  [manifest] 清理 {removed} 条记录（文件已缺失 {missing}）")
+    return manifest, original
+
+
+def _apply_rewrite(
+    md_path: Path,
+    text: str,
+    unique: dict[str, list[ImageHit]],
+    mapping: dict[str, str],
+    report: FileReport,
+    assets_dir: Path,
+    args: argparse.Namespace,
+) -> None:
+    """把 mapping 里的远程链接替换成本地相对路径，失败只记入 report。"""
+    rel = _relative_asset_dir(assets_dir, md_path.parent)
+    if rel is None:
+        report.failed.append(
+            (str(md_path), "图片目录与 Markdown 不在同一盘符，无法生成相对链接，已跳过回写")
+        )
+        return
+    # 同一 (start, end) 只能对应一个替换文本；出现分歧说明解析出的区间
+    # 互相覆盖，宁可整篇不回写，也不要把两份内容拼到同一段文本上。
+    spans_by_range: dict[tuple[int, int], str] = {}
+    conflict = ""
+    for url, hits_for_url in unique.items():
+        local = mapping.get(url)
+        if not local:
+            continue
+        new_text = _markdown_path((rel / local).as_posix())
+        for hit in hits_for_url:
+            span = (hit.start, hit.end)
+            if spans_by_range.setdefault(span, new_text) != new_text:
+                conflict = f"位置 {hit.start}-{hit.end} 被映射到多个本地路径"
+                break
+        if conflict:
+            break
+    if conflict:
+        report.failed.append((str(md_path), f"Markdown 回写区间冲突（{conflict}），已跳过回写"))
+        return
+    spans = sorted((start, end, replacement)
+                   for (start, end), replacement in spans_by_range.items())
+    out, cursor, overlap = [], 0, False
+    for start, end, new_text in spans:
+        if start < cursor:
+            overlap = True
+            break
+        out.append(text[cursor:start])
+        out.append(new_text)
+        cursor = end
+    if overlap:
+        report.failed.append((str(md_path), "Markdown 回写区间重叠，已跳过回写"))
+        return
+    out.append(text[cursor:])
+    new_content = "".join(out)
+    if new_content == text:
+        return
+    try:
+        if args.backup:
+            bak = md_path.with_suffix(md_path.suffix + ".bak")
+            if not bak.exists():
+                _atomic_write_bytes(bak, md_path.read_bytes())
+        _atomic_write_text(md_path, new_content, encoding="utf-8")
+    except OSError as exc:
+        report.failed.append(
+            (str(md_path), f"Markdown 回写失败: {type(exc).__name__}: {exc}")
+        )
+    else:
+        report.rewritten = True
+
+
+def _rewrite_from_manifest(
+    md_path: Path,
+    text: str,
+    unique: dict[str, list[ImageHit]],
+    report: FileReport,
+    assets_dir: Path,
+    args: argparse.Namespace,
+) -> FileReport:
+    """`--rewrite-only`：只按 manifest 里已有的登记回写，不访问网络。"""
+    manifest, original = _load_manifest_with_prune(assets_dir, args)
+    mapping: dict[str, str] = {}
+    for url in unique:
+        name = manifest.files.get(url)
+        if name and (assets_dir / name).is_file():
+            mapping[url] = name
+            report.skipped.append(url)
+            manifest.touch(url)
+        else:
+            report.failed.append((url, "manifest 未登记该 URL 或本地文件缺失，未回写"))
+    if manifest.files != original.files or manifest.seen != original.seen:
+        try:
+            _save_manifest(assets_dir, manifest)
+        except OSError as exc:
+            report.failed.append(
+                (str(md_path), f"资产清单写入失败: {type(exc).__name__}: {exc}")
+            )
+    if mapping:
+        _apply_rewrite(md_path, text, unique, mapping, report, assets_dir, args)
+    return report
+
+
 def process_file(
     md_path: Path,
     assets_dir: Path,
@@ -990,6 +1163,8 @@ def process_file(
         return report
 
     remote_urls = list(unique)
+    if args.rewrite_only:
+        return _rewrite_from_manifest(md_path, text, unique, report, assets_dir, args)
     assets_dir.mkdir(parents=True, exist_ok=True)  # 下载临时文件就落在这里
     results: dict[str, FetchResult] = {}
     keys: dict[str, str] = {}
@@ -1021,9 +1196,8 @@ def process_file(
             )
 
     mapping: dict[str, str] = {}
-    original_manifest = _load_manifest(assets_dir)
-    manifest = dict(original_manifest)
-    owners = {name.casefold(): url for url, name in manifest.items()}
+    manifest, original_manifest = _load_manifest_with_prune(assets_dir, args)
+    owners = {name.casefold(): url for url, name in manifest.files.items()}
     pending_writes: list[tuple[str, FetchResult, Path]] = []
 
     for seq, url in enumerate(remote_urls, start=1):
@@ -1033,12 +1207,13 @@ def process_file(
             continue
         name = guess_name(url, res.content_type, seq, res.image_ext)
         target, should_skip = _select_asset_target(
-            assets_dir, url, name, manifest, owners, used_names, args.overwrite
+            assets_dir, url, name, manifest.files, owners, used_names, args.overwrite
         )
         if should_skip:
             _unlink_quiet(res.path)  # 已有可用文件，不再保留这次下载的临时文件
             report.skipped.append(url)
             mapping[url] = target.name
+            manifest.touch(url)
             used_names[_path_key(target)] = url
             continue
         # Reserve the planned target in memory to keep different URLs from
@@ -1060,14 +1235,15 @@ def process_file(
             _unlink_quiet(res.path)
             report.failed.append((url, f"资产写入失败: {type(exc).__name__}: {exc}"))
             continue
-        manifest[url] = target.name
+        manifest.files[url] = target.name
+        manifest.touch(url)
         mapping[url] = target.name
         report.downloaded.append(target.name)
         successfully_written.append((url, target))
         if not args.quiet:
             print(f"  [ok] {target.name}  <-  {url}")
 
-    if manifest != original_manifest:
+    if manifest.files != original_manifest.files or manifest.seen != original_manifest.seen:
         try:
             _save_manifest(assets_dir, manifest)
         except OSError as exc:
@@ -1079,60 +1255,7 @@ def process_file(
 
     # 回写 Markdown
     if args.rewrite and mapping:
-        rel = _relative_asset_dir(assets_dir, md_path.parent)
-        if rel is None:
-            report.failed.append(
-                (str(md_path), "图片目录与 Markdown 不在同一盘符，无法生成相对链接，已跳过回写")
-            )
-            _cleanup_spools(results)
-            return report
-        # 同一 (start, end) 只能对应一个替换文本；出现分歧说明解析出的区间
-        # 互相覆盖，宁可整篇不回写，也不要把两份内容拼到同一段文本上。
-        spans_by_range: dict[tuple[int, int], str] = {}
-        conflict = ""
-        for url, hits_for_url in unique.items():
-            local = mapping.get(url)
-            if not local:
-                continue
-            new_text = _markdown_path((rel / local).as_posix())
-            for hit in hits_for_url:
-                span = (hit.start, hit.end)
-                if spans_by_range.setdefault(span, new_text) != new_text:
-                    conflict = f"位置 {hit.start}-{hit.end} 被映射到多个本地路径"
-                    break
-            if conflict:
-                break
-        if conflict:
-            report.failed.append((str(md_path), f"Markdown 回写区间冲突（{conflict}），已跳过回写"))
-        else:
-            spans = sorted((start, end, replacement)
-                           for (start, end), replacement in spans_by_range.items())
-            out, cursor, overlap = [], 0, False
-            for start, end, new_text in spans:
-                if start < cursor:
-                    overlap = True
-                    break
-                out.append(text[cursor:start])
-                out.append(new_text)
-                cursor = end
-            if overlap:
-                report.failed.append((str(md_path), "Markdown 回写区间重叠，已跳过回写"))
-            else:
-                out.append(text[cursor:])
-                new_content = "".join(out)
-                if new_content != text:
-                    try:
-                        if args.backup:
-                            bak = md_path.with_suffix(md_path.suffix + ".bak")
-                            if not bak.exists():
-                                _atomic_write_bytes(bak, md_path.read_bytes())
-                        _atomic_write_text(md_path, new_content, encoding="utf-8")
-                    except OSError as exc:
-                        report.failed.append(
-                            (str(md_path), f"Markdown 回写失败: {type(exc).__name__}: {exc}")
-                        )
-                    else:
-                        report.rewritten = True
+        _apply_rewrite(md_path, text, unique, mapping, report, assets_dir, args)
     _cleanup_spools(results)
     return report
 
@@ -1188,6 +1311,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-throttle", action="store_true",
                         help="关闭限流（小批量或自建图床时用）")
     parser.add_argument("--dry-run", action="store_true", help="只列出待下载的图片，不落盘")
+    parser.add_argument("--rewrite-only", action="store_true",
+                        help="只按资产清单里已有的登记回写本地链接，不联网下载")
+    parser.add_argument("--prune-manifest", type=int, default=None, metavar="DAYS",
+                        help="顺带清理 manifest：移除文件已缺失或超过 DAYS 天未命中的记录，"
+                             "0 表示只清理文件已缺失的记录")
     parser.add_argument("-q", "--quiet", action="store_true", help="只输出汇总")
     parser.set_defaults(recursive=True)
     return parser
@@ -1230,6 +1358,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--per-host-interval 必须是有限非负数")
     if args.max_image_size < 1:
         parser.error("--max-image-size 必须大于 0")
+    if args.prune_manifest is not None and args.prune_manifest < 0:
+        parser.error("--prune-manifest 必须大于等于 0")
+    if args.rewrite_only:
+        args.rewrite = True
 
     target: Path = args.target
     if not target.exists():
