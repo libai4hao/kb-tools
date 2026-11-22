@@ -854,6 +854,93 @@ class ManifestMaintenanceTest(unittest.TestCase):
             self.assertEqual(md.read_text(encoding="utf-8"), original)
 
 
+class IncrementalRunTest(unittest.TestCase):
+    """二次运行复用本地图片，以及回写前的并发修改检测。"""
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--allow-private-addresses", *args],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+
+    def test_second_run_reuses_local_images_without_refetch(self):
+        with tempfile.TemporaryDirectory() as work, _second_server() as base:
+            md = Path(work) / "again.md"
+            md.write_text(
+                f"![a]({base}/pic/0.png)\n![b]({base}/pic/1.png)\n", encoding="utf-8"
+            )
+            first = self._run(str(md))  # 只下载，不改 md，便于观察二次运行
+            self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+            self.assertEqual(first.stdout.count("[ok]"), 2)
+
+            _TrackingHandler.reset()
+            second = self._run(str(md))
+            self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+            self.assertEqual(_TrackingHandler.starts, [], "二次运行不应再发起请求")
+            self.assertNotIn("[ok]", second.stdout)
+            self.assertIn("远程 2，下载 0，已存在 2", second.stdout)
+
+    def test_deleted_asset_is_downloaded_again(self):
+        with tempfile.TemporaryDirectory() as work, _second_server() as base:
+            md = Path(work) / "heal.md"
+            md.write_text(f"![a]({base}/pic/0.png)\n", encoding="utf-8")
+            self.assertEqual(self._run(str(md)).returncode, 0)
+            asset = Path(work) / "heal.assets" / "0.png"
+            asset.unlink(missing_ok=True)
+
+            _TrackingHandler.reset()
+            proc = self._run(str(md))
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(len(_TrackingHandler.starts), 1, "缺图应重新下载一次")
+            self.assertTrue(asset.is_file())
+
+    def test_overwrite_forces_refetch(self):
+        with tempfile.TemporaryDirectory() as work, _second_server() as base:
+            md = Path(work) / "force.md"
+            md.write_text(f"![a]({base}/pic/0.png)\n", encoding="utf-8")
+            self.assertEqual(self._run(str(md)).returncode, 0)
+
+            _TrackingHandler.reset()
+            proc = self._run(str(md), "--overwrite")
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(len(_TrackingHandler.starts), 1, "--overwrite 应重新拉取")
+
+    def test_dry_run_reports_existing_images(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            md = Path(work) / "plan.md"
+            md.write_text(f"![a]({base}/pic/a.png)\n", encoding="utf-8")
+            self.assertEqual(self._run(str(md)).returncode, 0)
+            dry = self._run(str(md), "--dry-run")
+            self.assertEqual(dry.returncode, 0, dry.stderr + dry.stdout)
+            self.assertIn("将下载 0，已存在 1", dry.stdout)
+
+    def test_rewrite_skipped_when_file_changed_midrun(self):
+        with tempfile.TemporaryDirectory() as work, _single_image_server() as base:
+            md = Path(work) / "busy.md"
+            original = f"![a]({base}/pic/a.png)\n"
+            md.write_text(original, encoding="utf-8")
+            real = pull_images._file_signature
+            calls = {"n": 0}
+
+            def flaky(path):
+                sig = real(path)
+                calls["n"] += 1
+                if calls["n"] > 1:
+                    return (sig[0] + 10, sig[1])
+                return sig
+
+            buffer = io.StringIO()
+            with mock.patch("md_pull_images._file_signature", side_effect=flaky), \
+                    redirect_stdout(buffer):
+                code = pull_images.main(
+                    [str(md), "--allow-private-addresses", "--rewrite"]
+                )
+            output = buffer.getvalue()
+            self.assertEqual(code, 1, output)
+            self.assertIn("文件在运行期间被修改", output)
+            self.assertEqual(md.read_text(encoding="utf-8"), original)
+
+
 class StreamingAndSyntaxTest(unittest.TestCase):
     """图片边下边落盘，以及 `![a] (url)` 这类非图片写法。"""
 

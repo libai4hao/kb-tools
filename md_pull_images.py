@@ -18,6 +18,8 @@
 所以内存峰值只与 --jobs 和单图上限有关，不随批量总量增长。
 manifest 里还记录每个 URL 最近命中的时间：--rewrite-only 只按登记回写、不联网，
 --prune-manifest DAYS 清理文件已缺失或长期未命中的记录（只删记录不删图片）。
+二次运行时已登记且文件仍在的图片直接复用、不再发请求；--overwrite 才会强制重拉。
+回写前会比对读取时的 mtime/size，运行期间被外部改过的文件跳过不写。
 
 安全与限流默认值：单张上限 25 MiB，私网/回环/元数据地址默认拒绝（需
 --allow-private-addresses），远程图片总数超过 --throttle-threshold（默认 20）
@@ -1028,6 +1030,34 @@ def _relative_asset_dir(assets_dir: Path, md_parent: Path) -> Path | None:
         return None
 
 
+def _assets_dir_for(md_path: Path, args: argparse.Namespace, single: bool) -> Path:
+    if args.assets_dir:
+        base = Path(args.assets_dir)
+        return base if single else base / md_path.stem
+    return md_path.parent / f"{md_path.stem}.assets"
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    """(mtime_ns, size)：回写前用它判断文件是否被外部改过。"""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def _already_local(
+    url: str, recorded: dict[str, str], assets_dir: Path, overwrite: bool
+) -> str | None:
+    """manifest 已登记且文件仍在、又不是 --overwrite 时，返回可直接复用的文件名。"""
+    if overwrite:
+        return None
+    name = recorded.get(url)
+    if name and (assets_dir / name).is_file():
+        return name
+    return None
+
+
 def _load_manifest_with_prune(
     assets_dir: Path, args: argparse.Namespace
 ) -> tuple[Manifest, Manifest]:
@@ -1051,6 +1081,7 @@ def _apply_rewrite(
     report: FileReport,
     assets_dir: Path,
     args: argparse.Namespace,
+    expected_stat: tuple[int, int] | None,
 ) -> None:
     """把 mapping 里的远程链接替换成本地相对路径，失败只记入 report。"""
     rel = _relative_asset_dir(assets_dir, md_path.parent)
@@ -1095,6 +1126,9 @@ def _apply_rewrite(
     new_content = "".join(out)
     if new_content == text:
         return
+    if expected_stat is not None and _file_signature(md_path) != expected_stat:
+        report.failed.append((str(md_path), "文件在运行期间被修改，已跳过回写"))
+        return
     try:
         if args.backup:
             bak = md_path.with_suffix(md_path.suffix + ".bak")
@@ -1116,6 +1150,7 @@ def _rewrite_from_manifest(
     report: FileReport,
     assets_dir: Path,
     args: argparse.Namespace,
+    expected_stat: tuple[int, int] | None,
 ) -> FileReport:
     """`--rewrite-only`：只按 manifest 里已有的登记回写，不访问网络。"""
     manifest, original = _load_manifest_with_prune(assets_dir, args)
@@ -1136,7 +1171,8 @@ def _rewrite_from_manifest(
                 (str(md_path), f"资产清单写入失败: {type(exc).__name__}: {exc}")
             )
     if mapping:
-        _apply_rewrite(md_path, text, unique, mapping, report, assets_dir, args)
+        _apply_rewrite(md_path, text, unique, mapping, report, assets_dir, args,
+                       expected_stat)
     return report
 
 
@@ -1148,6 +1184,7 @@ def process_file(
     throttle: "HostThrottle | None" = None,
 ) -> FileReport:
     text = read_text(md_path)
+    expected_stat = _file_signature(md_path)
     hits = iter_hits(text)
     report = FileReport(md_path, assets_dir)
 
@@ -1164,23 +1201,40 @@ def process_file(
 
     remote_urls = list(unique)
     if args.rewrite_only:
-        return _rewrite_from_manifest(md_path, text, unique, report, assets_dir, args)
+        return _rewrite_from_manifest(md_path, text, unique, report, assets_dir, args,
+                                      expected_stat)
     assets_dir.mkdir(parents=True, exist_ok=True)  # 下载临时文件就落在这里
+    manifest, original_manifest = _load_manifest_with_prune(assets_dir, args)
+    owners = {name.casefold(): url for url, name in manifest.files.items()}
+    mapping: dict[str, str] = {}
+    # 已登记的图片直接复用，不再走网络：二次运行不该把整个库重新拉一遍。
+    pre_skipped: set[str] = set()
+    for url in remote_urls:
+        name = _already_local(url, manifest.files, assets_dir, args.overwrite)
+        if name is None:
+            continue
+        pre_skipped.add(url)
+        mapping[url] = name
+        report.skipped.append(url)
+        manifest.touch(url)
+        used_names[_path_key(assets_dir / name)] = url
+    to_fetch = [url for url in remote_urls if url not in pre_skipped]
+
     results: dict[str, FetchResult] = {}
     keys: dict[str, str] = {}
-    for url in remote_urls:
+    for url in to_fetch:
         try:
             keys[url] = throttle_key(url, args.throttle_scope)
         except ValueError:
             # Keep malformed URLs isolated; fetch() will report the URL error.
             keys[url] = url
-    if args.jobs > 1 and len(remote_urls) > 1:
+    if args.jobs > 1 and len(to_fetch) > 1:
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
             futures = {
                 pool.submit(fetch, u, args.timeout, args.retries,
                             args.referer, throttle, keys[u], args.max_image_size,
                             args.allow_private_addresses, assets_dir): u
-                for u in remote_urls
+                for u in to_fetch
             }
             for fut in as_completed(futures):
                 url = futures[fut]
@@ -1189,18 +1243,17 @@ def process_file(
                 except Exception as exc:  # noqa: BLE001
                     results[url] = FetchResult(url, error=str(exc))
     else:
-        for url in remote_urls:
+        for url in to_fetch:
             results[url] = fetch(
                 url, args.timeout, args.retries, args.referer, throttle, keys[url],
                 args.max_image_size, args.allow_private_addresses, assets_dir,
             )
 
-    mapping: dict[str, str] = {}
-    manifest, original_manifest = _load_manifest_with_prune(assets_dir, args)
-    owners = {name.casefold(): url for url, name in manifest.files.items()}
     pending_writes: list[tuple[str, FetchResult, Path]] = []
 
     for seq, url in enumerate(remote_urls, start=1):
+        if url in pre_skipped:
+            continue
         res = results[url]
         if res.error:
             report.failed.append((url, res.error))
@@ -1255,7 +1308,8 @@ def process_file(
 
     # 回写 Markdown
     if args.rewrite and mapping:
-        _apply_rewrite(md_path, text, unique, mapping, report, assets_dir, args)
+        _apply_rewrite(md_path, text, unique, mapping, report, assets_dir, args,
+                       expected_stat)
     _cleanup_spools(results)
     return report
 
@@ -1387,10 +1441,17 @@ def main(argv: list[str] | None = None) -> int:
         and (len(all_urls) > args.throttle_threshold or args.throttle_threshold <= 0)
     )
 
+    is_single = target.is_file()
     if args.dry_run:
         for md in files:
-            print(f"{md}: {len(per_file[md])} 张远程图片")
-            for url in per_file[md]:
+            assets_dir = _assets_dir_for(md, args, is_single)
+            recorded = _load_manifest(assets_dir).files
+            pending = [url for url in per_file[md]
+                       if _already_local(url, recorded, assets_dir, args.overwrite) is None]
+            kept = len(per_file[md]) - len(pending)
+            print(f"{md}: {len(per_file[md])} 张远程图片"
+                  f"（将下载 {len(pending)}，已存在 {kept}）")
+            for url in pending:
                 print(f"  - {url}")
         print(f"\n共 {len(files)} 个文件 / {len(all_urls)} 张唯一远程图片（dry-run，未下载）")
         if throttle_needed:
@@ -1408,16 +1469,11 @@ def main(argv: list[str] | None = None) -> int:
                   f"启用{scope_text}限流：每桶并发 ≤ {args.per_host_jobs}，"
                   f"同桶间隔 ≥ {args.per_host_interval}s（含抖动）")
 
-    is_single = target.is_file()
     reports: list[FileReport] = []
     used_names: dict[str, str] = {}  # 文件命名统一在主线程做，worker 只跑网络
 
     for md in files:
-        if is_single:
-            assets_dir = Path(args.assets_dir) if args.assets_dir else md.parent / f"{md.stem}.assets"
-        else:
-            assets_dir = (Path(args.assets_dir) / md.stem) if args.assets_dir \
-                else md.parent / f"{md.stem}.assets"
+        assets_dir = _assets_dir_for(md, args, is_single)
         if not args.quiet:
             print(f"\n>> {md}  (assets -> {assets_dir})")
         try:

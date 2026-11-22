@@ -74,7 +74,7 @@ python md_pull_images.py ./笔记库 --rewrite --prune-manifest 90
 | `--per-host-jobs` | 同桶并发上限，默认 `3` |
 | `--per-host-interval` | 同桶相邻请求最小间隔秒，默认 `0.4` |
 | `--no-throttle` | 关闭限流（小批量、自建图床时用） |
-| `--dry-run` | 只列出待下载图片，并提示是否将启用限流 |
+| `--dry-run` | 只列出待下载图片，标注「将下载 / 已存在」各多少张，并提示是否将启用限流 |
 | `--rewrite-only` | 只按 manifest 里已有的登记回写本地链接，不联网；用于跨盘、只读等回写失败后的补救 |
 | `--prune-manifest DAYS` | 顺带清理 manifest：移除文件已缺失、或超过 `DAYS` 天没被命中的记录；`0` 表示只清理文件已缺失的记录。只删记录，不删图片文件 |
 | `-q, --quiet` | 只输出汇总 |
@@ -171,6 +171,8 @@ python md_pull_images.py 排序算法.md --rewrite \
 - `![a] (url)`（标签和括号之间有空白的写法）按 CommonMark 算普通文本，不会被下载或改写；要当图片处理请写成 `![a](url)`；
 - `<assets-dir>` 与 Markdown 不在同一盘符（Windows）时无法生成相对链接：图片仍会落盘，该文件的回写会被跳过并计为失败，程序继续处理其余文件；
 - 单个文件出错（只读、无写权限、路径异常）只记录失败，不会中断整批任务；
+- 重复运行不会重新下载：manifest 已登记且文件仍在时直接复用记录、不发请求；`--overwrite` 才会强制重拉。本地文件被删除后，下一次运行会自动补下；
+- 回写前会比对读取时的 `mtime` 与大小：运行期间文件被编辑器或同步盘改过，就跳过该文件并把「文件在运行期间被修改」记入失败，不会覆盖外部改动；
 - 每张图下载完立即写入资产目录的临时文件（`.mdpull-*.part`），命名确定后再原子改名成最终文件；内存峰值只与 `--jobs × --max-image-size` 有关（默认 8 × 25 MiB 封顶），不再随图片总量线性增长。进程被强杀时可能残留 `.mdpull-*.part`，确认没有任务在跑后可直接删除，正常运行（含失败、跳过）都会清理；
 - 读取时按 UTF-8（含 BOM）、GB18030 顺序尝试解码，`--rewrite` 统一按 UTF-8 写回：GB18030 的旧笔记会被转码成 UTF-8，带 BOM 的文件会去掉 BOM；若需要保持原编码，请先自行转码再运行；
 - 输出编码：写到管道/重定向时统一用 UTF-8，交互终端保留系统编码、只把无法编码的字符替换掉，避免英文 Windows（cp1252）打印中文路径或提示时抛 `UnicodeEncodeError` 中断任务；
@@ -203,7 +205,7 @@ kb-tools/
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖下载与回写、引用式重复引用、代码块与 HTML 属性解析、同名文件冲突与 manifest 幂等、manifest 命中时间与清理规则、`--rewrite-only` 不联网回写、数值参数边界、图片体积/内容校验、私网与重定向拦截、`Retry-After` 日期解析、URL/站点分桶规范化，以及同源限流和跨源并行；另有一组用例校验 README 参数表与 CLI 参数、默认值保持同步，改参数时文档会跟着报错。离线测试的本地 HTTP 服务显式使用 `--allow-private-addresses`。
+测试覆盖下载与回写、引用式重复引用、代码块与 HTML 属性解析、同名文件冲突与 manifest 幂等、manifest 命中时间与清理规则、`--rewrite-only` 不联网回写、二次运行复用本地图片与缺图补下、回写前的并发修改检测、数值参数边界、图片体积/内容校验、私网与重定向拦截、`Retry-After` 日期解析、URL/站点分桶规范化，以及同源限流和跨源并行；另有一组用例校验 README 参数表与 CLI 参数、默认值保持同步，改参数时文档会跟着报错。离线测试的本地 HTTP 服务显式使用 `--allow-private-addresses`。
 
 CI（`.github/workflows/ci.yml`）在 Ubuntu（3.8 固定跑 ubuntu-22.04，新版 runner 已不再提供 3.8）与 Windows 上跑 Python 3.8、3.11、3.13 三档矩阵，覆盖 README 声明的 3.8+ 最低版本；本地只装了 3.13/3.11 也能靠单测里的 `ast.parse(feature_version=(3, 8))` 兜住语法层面的回退。
 
